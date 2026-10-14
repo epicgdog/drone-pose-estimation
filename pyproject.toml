@@ -1,0 +1,12 @@
+[project]
+name = "drone-pose-estimation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "djitellopy>=2.5.0",
+    "fmpose3d>=0.0.10",
+    "matplotlib>=3.11.2",
+    "opencv-python>=5.0.0.93",
+]
