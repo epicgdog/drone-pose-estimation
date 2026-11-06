@@ -14,7 +14,7 @@ The yolo model was also pre compiled and uses the mps device setting from pytorc
 
 These improvements led to 5X increase in FPS. 
 
-### Improvements
+### Todo
 - achieve steady 30fps
 - display the live pose somewhere
 - applications (live animations, predictive avoidance, continual learning)
