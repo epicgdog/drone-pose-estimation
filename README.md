@@ -7,10 +7,10 @@ https://drive.google.com/file/d/1n22INR8USTzreGKZkm-AEgynRVh18yws/view?usp=shari
 
 ### Current approach
 
-Our approach involves using the flow matching model outlined in FMPose3D in order to lift from 2D poses to 3D poses live. 
+Our approach involves using the flow matching model outlined in [FMPose3D](https://arxiv.org/abs/2602.05755) in order to lift from 2D poses to 3D poses live. 
 
-We loaded yolosm- as our 2D pose estimator with the custom one euro filter to smooth out poses
-The yolo model was also pre compiled and uses the mps device setting from pytorch, speeding up inference that would have taken much longer. The model also kept reloading into memory and slowed down inference which was stopped in these changes. 
+We loaded YOLO11s-pose (`yolo11s-pose`) as our 2D pose estimator with a custom [One Euro filter](https://gery.casiez.net/1euro/) ([paper](https://doi.org/10.1145/2207676.2208639)) to smooth out poses.
+The YOLO model was also pre compiled to CoreML (FP16), which runs on Apple's Neural Engine and is about 1.6x faster than the PyTorch model on the mps device. The 3D model also kept reloading into memory and slowed down inference, which was stopped in these changes. 
 
 These improvements led to 5X increase in FPS. 
 
