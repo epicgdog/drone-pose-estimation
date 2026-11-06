@@ -5,8 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "coremltools>=9.0",
     "djitellopy>=2.5.0",
     "fmpose3d>=0.0.10",
-    "matplotlib>=3.11.2",
+    "numpy<=2.3.5",
     "opencv-python>=5.0.0.93",
+    "pydantic>=2.14.1",
+    "ultralytics>=8.4.190",
 ]
