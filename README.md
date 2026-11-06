@@ -1,15 +1,20 @@
 # Drone Pose Estimation
-Using a DJI Tello Drone to estimate 3d poses using FM models. 
+Using a DJI Tello Drone to estimate 3D poses live. 
 
+## Demo:
 
-### Basic Approach:
+https://drive.google.com/file/d/1n22INR8USTzreGKZkm-AEgynRVh18yws/view?usp=sharing
 
-The way I will approach this is to record videos from the drone. Once finished, I will run the 2d pose estimation on it, then see the 3d model pose estimation. 
+### Current approach
 
-Recording video:
-- Use the opencv VideoWriter class that basically reads each frame and writes to a file. It checks every 1/30th of a second to write to the frame; runs on a separate thread
+Our approach involves using the flow matching model outlined in FMPose3D in order to lift from 2D poses to 3D poses live. 
 
-Inference:
-- Use the opencv VideoCapture class to get the frames of the video 
-- Stack frames and pass through first through 2d pose detection
-- After, pass those keyframes of 2d pose to 3d pose for estimation
+We loaded yolosm- as our 2D pose estimator with the custom one euro filter to smooth out poses
+The yolo model was also pre compiled and uses the mps device setting from pytorch, speeding up inference that would have taken much longer. The model also kept reloading into memory and slowed down inference which was stopped in these changes. 
+
+These improvements led to 5X increase in FPS. 
+
+### Improvements
+- achieve steady 30fps
+- display the live pose somewhere
+- applications (live animations, predictive avoidance, continual learning)

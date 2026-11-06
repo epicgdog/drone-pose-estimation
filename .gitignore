@@ -12,5 +12,13 @@ wheels/
 # Recorded flights
 videos/
 
+# Pose outputs (anywhere in the repo)
+*-pose.json
+*-pose.mp4
+
 # macOS
 .DS_Store
+
+# Downloaded model weights and exports
+*.pt
+*.mlpackage/
