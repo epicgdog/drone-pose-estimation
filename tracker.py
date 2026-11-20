@@ -137,3 +137,98 @@ class MeasurementFilter:
 
         cx, cy, size = self.euro.filter(np.array([m.cx, m.cy, m.size], dtype=np.float64))
         return Measurement(cx=float(cx), cy=float(cy), size=float(size), t=m.t)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class Axis:
+    def __init__(self, gain: float, cap: float, deadzone: float, slew: float):
+        self.gain = gain
+        self.cap = cap
+        self.deadzone = deadzone
+        self.slew = slew
+        self.prev = 0.0
+
+    def reset(self):
+        self.prev = 0.0
+
+    def update(self, err: float) -> int:
+        if abs(err) < self.deadzone:
+            cmd = 0.0
+        else:
+            cmd = _clamp(self.gain * err, -self.cap, self.cap)
+        # slew limit against the last output
+        cmd = _clamp(cmd, self.prev - self.slew, self.prev + self.slew)
+        self.prev = cmd
+        return int(round(cmd))
+
+
+class PersonTracker:
+    def __init__(self, cfg: TrackerConfig):
+        self.cfg = cfg
+        self.yaw_axis = Axis(cfg.gain_yaw, cfg.cap_yaw, 0.0, cfg.slew)
+        self.strafe_axis = Axis(cfg.gain_strafe, cfg.cap_strafe, 0.0, cfg.slew)
+        self.ud_axis = Axis(cfg.gain_ud, cfg.cap_ud, cfg.dz_y, cfg.slew)
+        self.fb_axis = Axis(cfg.gain_fb, cfg.cap_fb, cfg.dz_size, cfg.slew)
+        self.state = "idle"
+        self._last_seen = None  # time of last fresh measurement
+        self._last_ex = 0.0  # x error of last fresh measurement, for search dir
+
+    def reset(self):
+        for axis in (self.yaw_axis, self.strafe_axis, self.ud_axis, self.fb_axis):
+            axis.reset()
+        self._last_seen = None
+        self._last_ex = 0.0
+        self.state = "idle"
+
+    def update(self, m: Measurement | None, now: float, height_cm: float):
+        cfg = self.cfg
+        fresh = m is not None and now - m.t <= cfg.stale_s
+
+        if not fresh:
+            # lost: axes restart from zero
+            for axis in (self.yaw_axis, self.strafe_axis, self.ud_axis, self.fb_axis):
+                axis.reset()
+            if self._last_seen is None:
+                self._last_seen = now
+            lost_for = now - self._last_seen
+            if lost_for < cfg.lost_freeze_s:
+                self.state = "frozen"
+                return 0, 0, 0, 0
+            self.state = "searching"
+            direction = 1 if self._last_ex >= 0 else -1
+            return 0, 0, 0, int(round(direction * cfg.search_yaw))
+
+        self.state = "tracking"
+        self._last_seen = m.t
+
+        ex = m.cx - 0.5  # positive: person right of center
+        ey = 0.5 - m.cy  # positive: person above center
+        es = cfg.target_size - m.size  # positive: person too far away
+        self._last_ex = ex
+
+        # x errors inside the deadzone are zero, then split by lateral mode
+        if abs(ex) < cfg.dz_x:
+            ex = 0.0
+        if cfg.lateral_mode == "yaw":
+            yaw_err, strafe_err = ex, 0.0
+        elif cfg.lateral_mode == "strafe":
+            yaw_err, strafe_err = 0.0, ex
+        else:
+            w = _clamp(abs(ex) / (2 * cfg.mix_split), 0.0, 1.0)
+            yaw_err, strafe_err = w * ex, (1 - w) * ex
+
+        left_right = self.strafe_axis.update(strafe_err)
+        yaw = self.yaw_axis.update(yaw_err)
+        forward_backward = self.fb_axis.update(es)
+        up_down = self.ud_axis.update(ey)
+
+        # keep the drone in the altitude band
+        if height_cm <= cfg.min_alt_cm:
+            up_down = max(up_down, 0)
+        if height_cm >= cfg.max_alt_cm:
+            up_down = min(up_down, 0)
+
+        return left_right, forward_backward, up_down, yaw
