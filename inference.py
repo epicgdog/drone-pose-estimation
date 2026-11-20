@@ -1,7 +1,7 @@
 import time
 
 import numpy as np
-from fmpose3d import FMPose3DInference
+from fmpose3d import FMPose3DInference, Pose2DResult
 from fmpose3d.lib.preprocess import h36m_coco_format
 from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict
@@ -176,3 +176,26 @@ class VideoFrameInference:
         valid = result_3d.valid_frames_mask
         if valid is not None and not valid[0]:
             return None
+
+    def lift(self, coco_kpts, coco_scores, frame_shape):
+        # coco_kpts: (17, 2) pixels in the source frame, coco_scores: (17,)
+        # frame_shape: (h, w) of that frame, needed to normalize the 2d points.
+        kpts = np.asarray(coco_kpts, dtype=np.float32).reshape(1, 1, NUM_JOINTS, 2)
+        scores = np.asarray(coco_scores, dtype=np.float32).reshape(1, 1, NUM_JOINTS)
+
+        # h36m_coco_format drops the person entirely when all keypoints are zero
+        h36m_kpts, h36m_scores, _ = h36m_coco_format(kpts, scores)
+        if h36m_kpts.shape[0] == 0:
+            return None
+
+        result_2d = Pose2DResult(
+            keypoints=h36m_kpts,
+            scores=h36m_scores,
+            image_size=(int(frame_shape[0]), int(frame_shape[1])),
+            valid_frames_mask=np.any(h36m_scores > 0, axis=(0, 2)),
+        )
+        result_3d = self.api.pose_3d(result_2d, seed=self.seed)
+        valid = result_3d.valid_frames_mask
+        if valid is not None and not valid[0]:
+            return None
+        return np.asarray(result_3d.poses_3d_world[0])
