@@ -10,8 +10,8 @@ from djitellopy import Tello
 from pydantic import BaseModel
 
 from euro_filter import EuroFilter
-from inference import VideoFrameInference, YOLOTestCoco
-from main import wait_for_real_frame
+from inference import BONES, JOINTS_LEFT, JOINTS_RIGHT, VideoFrameInference, YOLOTestCoco
+from main import RECORD_FPS, VIDEO_DIR, wait_for_real_frame
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +245,7 @@ class LiftWorker:
     def __init__(self, inference: VideoFrameInference):
         self.inference = inference
         self.input = LatestSlot()  # (kpts, scores, frame_shape)
-        self.output = LatestSlot()  # newest 3d pose, (17, 3)
+        self.output = LatestSlot()  # (newest 3d pose (17, 3), time.monotonic() it was made)
         self.count = 0  # successful lifts, for fps logging
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="lift", daemon=True)
@@ -273,7 +273,104 @@ class LiftWorker:
                 continue
             self.count += 1
             if pose is not None:
-                self.output.set(pose)
+                self.output.set((pose, time.monotonic()))
+
+
+# recording colours, bgr. match the old pose videos: left blue, right orange.
+COLOR_LEFT, COLOR_RIGHT, COLOR_MID = (255, 160, 0), (0, 160, 255), (200, 200, 200)
+POSE_STALE_S = 0.5  # 3d pose older than this is drawn as missing
+
+
+def render_pose(pose, size, azim_deg=-35.0, elev_deg=15.0, span_m=2.2):
+    # (17, 3) h36m pose, meters, z up -> size x size bgr image. orthographic view,
+    # rotated around z by azim and tilted by elev, centered on the hip.
+    img = np.full((size, size, 3), 30, dtype=np.uint8)
+    if pose is None:
+        cv2.putText(img, "no 3d pose", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (160, 160, 160), 2, cv2.LINE_AA)
+        return img
+    p = np.asarray(pose, dtype=np.float64) - np.asarray(pose[0], dtype=np.float64)
+    a, e = np.radians(azim_deg), np.radians(elev_deg)
+    rot_z = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
+    rot_x = np.array([[1, 0, 0], [0, np.cos(e), -np.sin(e)], [0, np.sin(e), np.cos(e)]])
+    p = p @ rot_z.T @ rot_x.T
+    scale = size / span_m
+    # screen: x right, y down. world z up -> screen up.
+    uv = np.stack([size / 2 + p[:, 0] * scale, size / 2 - p[:, 2] * scale], axis=1)
+    uv = np.round(uv).astype(int)
+
+    # floor line under the lowest joint, for a sense of up
+    floor = int(np.clip(uv[:, 1].max() + 10, 0, size - 1))
+    cv2.line(img, (20, floor), (size - 20, floor), (70, 70, 70), 1, cv2.LINE_AA)
+
+    for j1, j2 in BONES:
+        if j1 in JOINTS_LEFT or j2 in JOINTS_LEFT:
+            color = COLOR_LEFT
+        elif j1 in JOINTS_RIGHT or j2 in JOINTS_RIGHT:
+            color = COLOR_RIGHT
+        else:
+            color = COLOR_MID
+        cv2.line(img, tuple(uv[j1]), tuple(uv[j2]), color, 3, cv2.LINE_AA)
+    for x, y in uv:
+        cv2.circle(img, (int(x), int(y)), 4, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.putText(img, "3d pose", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                (200, 200, 200), 2, cv2.LINE_AA)
+    return img
+
+
+class Recorder:
+    # own thread: writes the camera frame with the newest 3d pose next to it, at a
+    # fixed fps so the video plays back in real time (frames repeat if the stream lags).
+    def __init__(self, frame_read, worker: LiftWorker, fps: float = RECORD_FPS):
+        self.frame_read = frame_read
+        self.worker = worker
+        self.fps = fps
+        h, w = frame_read.frame.shape[:2]
+        self.panel = h  # square 3d panel, same height as the frame
+        VIDEO_DIR.mkdir(exist_ok=True)
+        self.path = VIDEO_DIR / time.strftime("tello-track-%Y%m%d-%H%M%S.mp4")
+        self.writer = cv2.VideoWriter(
+            str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w + self.panel, h)
+        )
+        if not self.writer.isOpened():
+            raise RuntimeError(f"Could not open VideoWriter for {self.path}")
+        self.size = (w, h)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="record", daemon=True)
+
+    def start(self):
+        logger.info("recording to %s", self.path)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.writer.release()
+        logger.info("saved recording %s", self.path)
+
+    def _run(self):
+        interval = 1.0 / self.fps
+        next_t = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                frame = self.frame_read.frame
+                if frame is not None and (frame.shape[1], frame.shape[0]) == self.size:
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    out = self.worker.output.get()
+                    pose = None
+                    if out is not None and time.monotonic() - out[1] <= POSE_STALE_S:
+                        pose = out[0]
+                    panel = render_pose(pose, self.panel)
+                    self.writer.write(np.hstack([bgr, panel]))
+            except Exception:
+                # never let recording take down tracking
+                logger.exception("recording frame failed")
+            next_t += interval
+            delay = next_t - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_t = time.monotonic()  # fell behind, don't try to catch up
 
 
 def describe(cmd) -> str:
@@ -399,6 +496,11 @@ def main():
         help="how x error is handled: turn, strafe, or a blend (default mix)",
     )
     parser.add_argument(
+        "--no-record",
+        action="store_true",
+        help="don't save the camera + 3d pose video to videos/",
+    )
+    parser.add_argument(
         "--flight-s",
         type=float,
         default=60,
@@ -420,9 +522,13 @@ def main():
     # the laptop is the only controller: it takes off and lands. keep the phone app
     # disconnected, its stick packets fight the rc commands sent here.
     took_off = False
+    recorder = None
     try:
         wait_for_real_frame(frame_read)
         worker.start()
+        if not args.no_record:
+            recorder = Recorder(frame_read, worker)
+            recorder.start()
         if not args.dry_run:
             logger.info("taking off, ctrl+c to land")
             took_off = True  # set first so ctrl+c mid takeoff still lands
@@ -448,6 +554,8 @@ def main():
                 tello.land()
             except Exception:
                 logger.exception("land failed, land it from the phone app or catch it")
+        if recorder is not None:
+            recorder.stop()
         tello.streamoff()
 
 
