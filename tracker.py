@@ -410,12 +410,19 @@ def main():
     tello.streamon()
     frame_read = tello.get_frame_read()
 
+    # the laptop is the only controller: it takes off and lands. keep the phone app
+    # disconnected, its stick packets fight the rc commands sent here.
+    took_off = False
     try:
         wait_for_real_frame(frame_read)
         worker.start()
+        if not args.dry_run:
+            logger.info("taking off, ctrl+c to land")
+            took_off = True  # set first so ctrl+c mid takeoff still lands
+            tello.takeoff()
         track(tello, frame_read, args, worker)
     except KeyboardInterrupt:
-        logger.info("interrupted, stopping")
+        logger.info("interrupted, %s", "landing" if took_off else "stopping")
     finally:
         worker.stop()
         if not args.dry_run:
@@ -423,6 +430,11 @@ def main():
                 tello.send_rc_control(0, 0, 0, 0)
             except Exception:
                 logger.exception("failed to send stop command")
+        if took_off:
+            try:
+                tello.land()
+            except Exception:
+                logger.exception("land failed, land it from the phone app or catch it")
         tello.streamoff()
 
 
