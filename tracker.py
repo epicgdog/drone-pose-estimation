@@ -401,8 +401,8 @@ def main():
     parser.add_argument(
         "--flight-s",
         type=float,
-        default=30,
-        help="seconds to track after takeoff before landing (default 30, 0 = until ctrl+c)",
+        default=60,
+        help="seconds to track after takeoff before landing (default 60, 0 = until ctrl+c)",
     )
     args = parser.parse_args()
 
