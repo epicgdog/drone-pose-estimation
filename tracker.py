@@ -338,7 +338,8 @@ class EventLog:
             logger.info("on the ground, tracking idle")
 
 
-def track(tello, frame_read, args, worker: LiftWorker):
+def track(tello, frame_read, args, worker: LiftWorker, until: float | None = None):
+    # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
     cfg = TrackerConfig(lateral_mode=args.lateral)
     yolo = YOLOTestCoco(device="mps")
     yolo.setup_runtime()
@@ -348,7 +349,7 @@ def track(tello, frame_read, args, worker: LiftWorker):
 
     last_frame = None
 
-    while True:
+    while until is None or time.monotonic() < until:
         frame = frame_read.frame
         if frame is None or frame is last_frame:
             time.sleep(0.005)
@@ -397,6 +398,12 @@ def main():
         default="mix",
         help="how x error is handled: turn, strafe, or a blend (default mix)",
     )
+    parser.add_argument(
+        "--flight-s",
+        type=float,
+        default=30,
+        help="seconds to track after takeoff before landing (default 30, 0 = until ctrl+c)",
+    )
     args = parser.parse_args()
 
     logger.info("Starting up!")
@@ -420,7 +427,13 @@ def main():
             logger.info("taking off, ctrl+c to land")
             took_off = True  # set first so ctrl+c mid takeoff still lands
             tello.takeoff()
-        track(tello, frame_read, args, worker)
+        until = None
+        if not args.dry_run and args.flight_s > 0:
+            until = time.monotonic() + args.flight_s
+            logger.info("landing in %.0f s", args.flight_s)
+        track(tello, frame_read, args, worker, until)
+        if until is not None:
+            logger.info("flight time up, landing")
     except KeyboardInterrupt:
         logger.info("interrupted, %s", "landing" if took_off else "stopping")
     finally:
