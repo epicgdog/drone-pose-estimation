@@ -42,7 +42,6 @@ class TrackerConfig(BaseModel):
     cap_ud: float = 40
     cap_fb: float = 40
 
-    slew: float = 15  # max command change per step
     lateral_mode: Literal["yaw", "strafe", "mix"] = "mix"
     mix_split: float = 0.2  # |x error| where the blend is half yaw, half strafe
 
@@ -150,41 +149,31 @@ def _clamp(v, lo, hi):
 
 
 class Axis:
-    def __init__(self, gain: float, cap: float, deadzone: float, slew: float):
+    def __init__(self, gain: float, cap: float, deadzone: float):
         self.gain = gain
         self.cap = cap
         self.deadzone = deadzone
-        self.slew = slew
-        self.prev = 0.0
-
-    def reset(self):
-        self.prev = 0.0
 
     def update(self, err: float) -> int:
         if abs(err) < self.deadzone:
             cmd = 0.0
         else:
             cmd = _clamp(self.gain * err, -self.cap, self.cap)
-        # slew limit against the last output
-        cmd = _clamp(cmd, self.prev - self.slew, self.prev + self.slew)
-        self.prev = cmd
         return int(round(cmd))
 
 
 class PersonTracker:
     def __init__(self, cfg: TrackerConfig):
         self.cfg = cfg
-        self.yaw_axis = Axis(cfg.gain_yaw, cfg.cap_yaw, 0.0, cfg.slew)
-        self.strafe_axis = Axis(cfg.gain_strafe, cfg.cap_strafe, 0.0, cfg.slew)
-        self.ud_axis = Axis(cfg.gain_ud, cfg.cap_ud, cfg.dz_y, cfg.slew)
-        self.fb_axis = Axis(cfg.gain_fb, cfg.cap_fb, cfg.dz_size, cfg.slew)
+        self.yaw_axis = Axis(cfg.gain_yaw, cfg.cap_yaw, 0.0)
+        self.strafe_axis = Axis(cfg.gain_strafe, cfg.cap_strafe, 0.0)
+        self.ud_axis = Axis(cfg.gain_ud, cfg.cap_ud, cfg.dz_y)
+        self.fb_axis = Axis(cfg.gain_fb, cfg.cap_fb, cfg.dz_size)
         self.state = "idle"
         self._last_seen = None  # time of last fresh measurement
         self._last_ex = 0.0  # x error of last fresh measurement, for search dir
 
     def reset(self):
-        for axis in (self.yaw_axis, self.strafe_axis, self.ud_axis, self.fb_axis):
-            axis.reset()
         self._last_seen = None
         self._last_ex = 0.0
         self.state = "idle"
@@ -194,9 +183,6 @@ class PersonTracker:
         fresh = m is not None and now - m.t <= cfg.stale_s
 
         if not fresh:
-            # lost: axes restart from zero
-            for axis in (self.yaw_axis, self.strafe_axis, self.ud_axis, self.fb_axis):
-                axis.reset()
             if self._last_seen is None:
                 self._last_seen = now
             lost_for = now - self._last_seen
