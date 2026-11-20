@@ -290,17 +290,77 @@ class LiftWorker:
                 self.output.set(pose)
 
 
+def describe(cmd) -> str:
+    # rc command -> what the drone is doing, in words
+    left_right, forward_backward, up_down, yaw = cmd
+    moves = []
+    if yaw:
+        moves.append("turn right" if yaw > 0 else "turn left")
+    if left_right:
+        moves.append("strafe right" if left_right > 0 else "strafe left")
+    if forward_backward:
+        moves.append("closer" if forward_backward > 0 else "back off")
+    if up_down:
+        moves.append("up" if up_down > 0 else "down")
+    return ", ".join(moves) or "holding"
+
+
+class EventLog:
+    # logs only tracking events: state changes and changes in what the drone is doing.
+    STABLE_FRAMES = 3  # an adjustment must hold this many frames before it's logged
+
+    def __init__(self):
+        self.state = "idle"
+        self.adjust = None  # last logged adjustment
+        self._candidate = None
+        self._count = 0
+
+    def update(self, state, m: Measurement | None, cmd):
+        if state != self.state:
+            self._log_state(self.state, state, m, cmd)
+            self.state = state
+            self.adjust = None
+            self._candidate = None
+        if state != "tracking":
+            return
+        adjust = describe(cmd)
+        if adjust == self.adjust:
+            self._candidate = None
+            return
+        # debounce: near a deadzone edge the command can flicker frame to frame
+        if adjust != self._candidate:
+            self._candidate, self._count = adjust, 0
+        self._count += 1
+        if self._count >= self.STABLE_FRAMES:
+            logger.info("adjusting: %s", adjust)
+            self.adjust = adjust
+            self._candidate = None
+
+    @staticmethod
+    def _log_state(old, new, m, cmd):
+        if new == "tracking":
+            verb = "locked on" if old == "idle" else "reacquired"
+            logger.info("%s person at x=%.2f size=%.2f", verb, m.cx, m.size)
+        elif new == "frozen":
+            if old == "idle":
+                logger.info("airborne, looking for person")
+            else:
+                logger.info("lost person, holding position")
+        elif new == "searching":
+            logger.info("searching: %s", describe(cmd))
+        elif new == "idle":
+            logger.info("on the ground, tracking idle")
+
+
 def track(tello, frame_read, args, worker: LiftWorker):
     cfg = TrackerConfig(lateral_mode=args.lateral)
     yolo = YOLOTestCoco(device="mps")
     yolo.setup_runtime()
     mfilter = MeasurementFilter(cfg)
     tracker = PersonTracker(cfg)
+    events = EventLog()
 
     last_frame = None
-    last_log = time.monotonic()
-    frames_since_log = 0
-    lifts_at_log = worker.count
 
     while True:
         frame = frame_read.frame
@@ -308,7 +368,6 @@ def track(tello, frame_read, args, worker: LiftWorker):
             time.sleep(0.005)
             continue
         last_frame = frame
-        frames_since_log += 1
         # rgb to bgr since opencv and yolo expect bgr.
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
@@ -336,24 +395,7 @@ def track(tello, frame_read, args, worker: LiftWorker):
             cmd = None
             state = "idle"
 
-        if now - last_log >= 1.0:
-            elapsed = now - last_log
-            if m is not None:
-                pos = f"cx={m.cx:.2f} cy={m.cy:.2f} size={m.size:.2f}"
-            else:
-                pos = "cx=- cy=- size=-"
-            logger.info(
-                "state=%s %s cmd=%s height=%s track_fps=%.1f lift_fps=%.1f",
-                state,
-                pos,
-                cmd,
-                height,
-                frames_since_log / elapsed,
-                (worker.count - lifts_at_log) / elapsed,
-            )
-            last_log = now
-            frames_since_log = 0
-            lifts_at_log = worker.count
+        events.update(state, m, cmd)
 
 
 def main():
@@ -402,4 +444,6 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
+    # djitellopy logs every rc command at info; keep only its warnings and errors
+    Tello.LOGGER.setLevel(logging.WARNING)
     main()
