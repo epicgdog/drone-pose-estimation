@@ -1,11 +1,17 @@
+import argparse
 import logging
+import threading
 import time
 from typing import Literal
 
+import cv2
 import numpy as np
+from djitellopy import Tello
 from pydantic import BaseModel
 
 from euro_filter import EuroFilter
+from inference import VideoFrameInference, YOLOTestCoco
+from main import wait_for_real_frame
 
 logger = logging.getLogger(__name__)
 
@@ -232,3 +238,168 @@ class PersonTracker:
             up_down = min(up_down, 0)
 
         return left_right, forward_backward, up_down, yaw
+
+
+class LatestSlot:
+    # holds only the newest value. writers overwrite, readers take the latest.
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._value = None
+
+    def set(self, value):
+        with self._lock:
+            self._value = value
+
+    def get(self):
+        with self._lock:
+            return self._value
+
+
+class LiftWorker:
+    def __init__(self, inference: VideoFrameInference):
+        self.inference = inference
+        self.input = LatestSlot()  # (kpts, scores, frame_shape)
+        self.output = LatestSlot()  # newest 3d pose, (17, 3)
+        self.count = 0  # successful lifts, for fps logging
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="lift", daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        last = None
+        while not self._stop.is_set():
+            item = self.input.get()
+            if item is None or item is last:
+                time.sleep(0.005)
+                continue
+            last = item
+            kpts, scores, frame_shape = item
+            try:
+                pose = self.inference.lift(kpts, scores, frame_shape)
+            except Exception:
+                # never let lifting take down tracking
+                logger.exception("lift failed")
+                continue
+            self.count += 1
+            if pose is not None:
+                self.output.set(pose)
+
+
+def track(tello, frame_read, args, worker: LiftWorker):
+    cfg = TrackerConfig(lateral_mode=args.lateral)
+    yolo = YOLOTestCoco(device="mps")
+    yolo.setup_runtime()
+    mfilter = MeasurementFilter(cfg)
+    tracker = PersonTracker(cfg)
+
+    last_frame = None
+    last_log = time.monotonic()
+    frames_since_log = 0
+    lifts_at_log = worker.count
+
+    while True:
+        frame = frame_read.frame
+        if frame is None or frame is last_frame:
+            time.sleep(0.005)
+            continue
+        last_frame = frame
+        frames_since_log += 1
+        # rgb to bgr since opencv and yolo expect bgr.
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        det = yolo._detect_best_person(bgr)
+        m = None
+        if det is None:
+            mfilter.reset()
+        else:
+            raw = measure(det.keypoints, det.scores, bgr.shape, cfg)
+            m = mfilter.update(raw)
+            if m is not None:
+                worker.input.set((det.keypoints, det.scores, bgr.shape[:2]))
+
+        height = tello.get_height()
+        now = time.monotonic()
+        if height > cfg.airborne_cm:
+            cmd = tracker.update(m, now, height)
+            if not args.dry_run:
+                tello.send_rc_control(*cmd)
+            state = tracker.state
+        else:
+            # on the ground: send nothing, start fresh once airborne
+            tracker.reset()
+            mfilter.reset()
+            cmd = None
+            state = "idle"
+
+        if now - last_log >= 1.0:
+            elapsed = now - last_log
+            if m is not None:
+                pos = f"cx={m.cx:.2f} cy={m.cy:.2f} size={m.size:.2f}"
+            else:
+                pos = "cx=- cy=- size=-"
+            logger.info(
+                "state=%s %s cmd=%s height=%s track_fps=%.1f lift_fps=%.1f",
+                state,
+                pos,
+                cmd,
+                height,
+                frames_since_log / elapsed,
+                (worker.count - lifts_at_log) / elapsed,
+            )
+            last_log = now
+            frames_since_log = 0
+            lifts_at_log = worker.count
+
+
+def main():
+    parser = argparse.ArgumentParser(description="follow a person with a tello drone")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="compute and log commands, never send them to the drone",
+    )
+    parser.add_argument(
+        "--lateral",
+        choices=["yaw", "strafe", "mix"],
+        default="mix",
+        help="how x error is handled: turn, strafe, or a blend (default mix)",
+    )
+    args = parser.parse_args()
+
+    logger.info("Starting up!")
+    lift_inference = VideoFrameInference(device="mps")
+    worker = LiftWorker(lift_inference)
+
+    tello = Tello()
+    tello.connect()
+    logger.info("Battery: %s", tello.get_battery())
+
+    tello.streamon()
+    frame_read = tello.get_frame_read()
+
+    try:
+        wait_for_real_frame(frame_read)
+        worker.start()
+        track(tello, frame_read, args, worker)
+    except KeyboardInterrupt:
+        logger.info("interrupted, stopping")
+    finally:
+        worker.stop()
+        if not args.dry_run:
+            try:
+                tello.send_rc_control(0, 0, 0, 0)
+            except Exception:
+                logger.exception("failed to send stop command")
+        tello.streamoff()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+    main()
