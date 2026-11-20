@@ -10,8 +10,9 @@ from djitellopy import Tello
 from pydantic import BaseModel
 
 from euro_filter import EuroFilter
-from inference import BONES, JOINTS_LEFT, JOINTS_RIGHT, VideoFrameInference, YOLOTestCoco
+from inference import VideoFrameInference, YOLOTestCoco
 from main import RECORD_FPS, VIDEO_DIR, wait_for_real_frame
+from pose_video import render_video
 
 logger = logging.getLogger(__name__)
 
@@ -276,65 +277,22 @@ class LiftWorker:
                 self.output.set((pose, time.monotonic()))
 
 
-# recording colours, bgr. match the old pose videos: left blue, right orange.
-COLOR_LEFT, COLOR_RIGHT, COLOR_MID = (255, 160, 0), (0, 160, 255), (200, 200, 200)
-POSE_STALE_S = 0.5  # 3d pose older than this is drawn as missing
-
-
-def render_pose(pose, size, azim_deg=-35.0, elev_deg=15.0, span_m=2.2):
-    # (17, 3) h36m pose, meters, z up -> size x size bgr image. orthographic view,
-    # rotated around z by azim and tilted by elev, centered on the hip.
-    img = np.full((size, size, 3), 30, dtype=np.uint8)
-    if pose is None:
-        cv2.putText(img, "no 3d pose", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                    (160, 160, 160), 2, cv2.LINE_AA)
-        return img
-    p = np.asarray(pose, dtype=np.float64) - np.asarray(pose[0], dtype=np.float64)
-    a, e = np.radians(azim_deg), np.radians(elev_deg)
-    rot_z = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
-    rot_x = np.array([[1, 0, 0], [0, np.cos(e), -np.sin(e)], [0, np.sin(e), np.cos(e)]])
-    p = p @ rot_z.T @ rot_x.T
-    scale = size / span_m
-    # screen: x right, y down. world z up -> screen up.
-    uv = np.stack([size / 2 + p[:, 0] * scale, size / 2 - p[:, 2] * scale], axis=1)
-    uv = np.round(uv).astype(int)
-
-    # floor line under the lowest joint, for a sense of up
-    floor = int(np.clip(uv[:, 1].max() + 10, 0, size - 1))
-    cv2.line(img, (20, floor), (size - 20, floor), (70, 70, 70), 1, cv2.LINE_AA)
-
-    for j1, j2 in BONES:
-        if j1 in JOINTS_LEFT or j2 in JOINTS_LEFT:
-            color = COLOR_LEFT
-        elif j1 in JOINTS_RIGHT or j2 in JOINTS_RIGHT:
-            color = COLOR_RIGHT
-        else:
-            color = COLOR_MID
-        cv2.line(img, tuple(uv[j1]), tuple(uv[j2]), color, 3, cv2.LINE_AA)
-    for x, y in uv:
-        cv2.circle(img, (int(x), int(y)), 4, (255, 255, 255), -1, cv2.LINE_AA)
-    cv2.putText(img, "3d pose", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                (200, 200, 200), 2, cv2.LINE_AA)
-    return img
-
 
 class Recorder:
-    # own thread: writes the camera frame with the newest 3d pose next to it, at a
-    # fixed fps so the video plays back in real time (frames repeat if the stream lags).
-    def __init__(self, frame_read, worker: LiftWorker, fps: float = RECORD_FPS):
+    # own thread: writes the raw camera frames at a fixed fps so the video plays back in
+    # real time (frames repeat if the stream lags). the 3d pose is rendered after landing.
+    def __init__(self, frame_read, fps: float = RECORD_FPS):
         self.frame_read = frame_read
-        self.worker = worker
         self.fps = fps
         h, w = frame_read.frame.shape[:2]
-        self.panel = h  # square 3d panel, same height as the frame
+        self.size = (w, h)
         VIDEO_DIR.mkdir(exist_ok=True)
         self.path = VIDEO_DIR / time.strftime("tello-track-%Y%m%d-%H%M%S.mp4")
         self.writer = cv2.VideoWriter(
-            str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w + self.panel, h)
+            str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), fps, self.size
         )
         if not self.writer.isOpened():
             raise RuntimeError(f"Could not open VideoWriter for {self.path}")
-        self.size = (w, h)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="record", daemon=True)
 
@@ -355,13 +313,7 @@ class Recorder:
             try:
                 frame = self.frame_read.frame
                 if frame is not None and (frame.shape[1], frame.shape[0]) == self.size:
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    out = self.worker.output.get()
-                    pose = None
-                    if out is not None and time.monotonic() - out[1] <= POSE_STALE_S:
-                        pose = out[0]
-                    panel = render_pose(pose, self.panel)
-                    self.writer.write(np.hstack([bgr, panel]))
+                    self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             except Exception:
                 # never let recording take down tracking
                 logger.exception("recording frame failed")
@@ -373,69 +325,7 @@ class Recorder:
                 next_t = time.monotonic()  # fell behind, don't try to catch up
 
 
-def describe(cmd) -> str:
-    # rc command -> what the drone is doing, in words
-    left_right, forward_backward, up_down, yaw = cmd
-    moves = []
-    if yaw:
-        moves.append("turn right" if yaw > 0 else "turn left")
-    if left_right:
-        moves.append("strafe right" if left_right > 0 else "strafe left")
-    if forward_backward:
-        moves.append("closer" if forward_backward > 0 else "back off")
-    if up_down:
-        moves.append("up" if up_down > 0 else "down")
-    return ", ".join(moves) or "holding"
-
-
-class EventLog:
-    # logs only tracking events: state changes and changes in what the drone is doing.
-    STABLE_FRAMES = 3  # an adjustment must hold this many frames before it's logged
-
-    def __init__(self):
-        self.state = "idle"
-        self.adjust = None  # last logged adjustment
-        self._candidate = None
-        self._count = 0
-
-    def update(self, state, m: Measurement | None, cmd):
-        if state != self.state:
-            self._log_state(self.state, state, m, cmd)
-            self.state = state
-            self.adjust = None
-            self._candidate = None
-        if state != "tracking":
-            return
-        adjust = describe(cmd)
-        if adjust == self.adjust:
-            self._candidate = None
-            return
-        # debounce: near a deadzone edge the command can flicker frame to frame
-        if adjust != self._candidate:
-            self._candidate, self._count = adjust, 0
-        self._count += 1
-        if self._count >= self.STABLE_FRAMES:
-            logger.info("adjusting: %s", adjust)
-            self.adjust = adjust
-            self._candidate = None
-
-    @staticmethod
-    def _log_state(old, new, m, cmd):
-        if new == "tracking":
-            verb = "locked on" if old == "idle" else "reacquired"
-            logger.info("%s person at x=%.2f size=%.2f", verb, m.cx, m.size)
-        elif new == "frozen":
-            if old == "idle":
-                logger.info("airborne, looking for person")
-            else:
-                logger.info("lost person, holding position")
-        elif new == "searching":
-            logger.info("searching: %s", describe(cmd))
-        elif new == "idle":
-            logger.info("on the ground, tracking idle")
-
-
-def track(tello, frame_read, args, worker: LiftWorker, until: float | None = None):
+def track(tello, frame_read, args, worker: LiftWorker | None, until: float | None = None):
     # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
     cfg = TrackerConfig(lateral_mode=args.lateral)
     yolo = YOLOTestCoco(device="mps")
@@ -462,7 +352,7 @@ def track(tello, frame_read, args, worker: LiftWorker, until: float | None = Non
         else:
             raw = measure(det.keypoints, det.scores, bgr.shape, cfg)
             m = mfilter.update(raw)
-            if m is not None:
+            if m is not None and worker is not None:
                 worker.input.set((det.keypoints, det.scores, bgr.shape[:2]))
 
         height = tello.get_height()
@@ -498,7 +388,17 @@ def main():
     parser.add_argument(
         "--no-record",
         action="store_true",
-        help="don't save the camera + 3d pose video to videos/",
+        help="don't save the flight video to videos/",
+    )
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="don't run the 3d pose on the recording after landing",
+    )
+    parser.add_argument(
+        "--live-lift",
+        action="store_true",
+        help="also run the 3d lift live during flight (slows tracking, output unused for now)",
     )
     parser.add_argument(
         "--flight-s",
@@ -509,8 +409,7 @@ def main():
     args = parser.parse_args()
 
     logger.info("Starting up!")
-    lift_inference = VideoFrameInference(device="mps")
-    worker = LiftWorker(lift_inference)
+    worker = LiftWorker(VideoFrameInference(device="mps")) if args.live_lift else None
 
     tello = Tello()
     tello.connect()
@@ -525,9 +424,10 @@ def main():
     recorder = None
     try:
         wait_for_real_frame(frame_read)
-        worker.start()
+        if worker is not None:
+            worker.start()
         if not args.no_record:
-            recorder = Recorder(frame_read, worker)
+            recorder = Recorder(frame_read)
             recorder.start()
         if not args.dry_run:
             logger.info("taking off, ctrl+c to land")
@@ -543,7 +443,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("interrupted, %s", "landing" if took_off else "stopping")
     finally:
-        worker.stop()
+        if worker is not None:
+            worker.stop()
         if not args.dry_run:
             try:
                 tello.send_rc_control(0, 0, 0, 0)
@@ -557,6 +458,14 @@ def main():
         if recorder is not None:
             recorder.stop()
         tello.streamoff()
+
+    # drone is down: now there's time for the full 3d pass on every recorded frame
+    if recorder is not None and not args.no_render:
+        logger.info("rendering 3d pose, ctrl+c to skip (run pose_video.py on it later)")
+        try:
+            render_video(recorder.path, inference=worker.inference if worker else None)
+        except KeyboardInterrupt:
+            logger.info("skipped render: uv run python3 pose_video.py %s", recorder.path)
 
 
 if __name__ == "__main__":
