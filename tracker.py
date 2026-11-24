@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 # coco-17 indices
 L_SHOULDER, R_SHOULDER, L_HIP, R_HIP = 5, 6, 11, 12
 
+RC_MAX = 100  # tello rc range is -100..100
+
 
 class TrackerConfig(BaseModel):
     # measurement
@@ -29,16 +31,21 @@ class TrackerConfig(BaseModel):
     dz_size: float = 0.03
 
     # gains, command units per unit error
-    gain_yaw: float = 120
-    gain_strafe: float = 80
-    gain_ud: float = 100
-    gain_fb: float = 200
+    gain_yaw: float = 360
+    gain_strafe: float = 120
+    gain_ud: float = 150
+    gain_fb: float = 300
 
-    # caps, tello rc range is -100..100
-    cap_yaw: float = 60
-    cap_strafe: float = 40
-    cap_ud: float = 40
+    # d gains, command units per (unit error per second). about 0.1 s of
+    # lookahead: d_gain / gain. no filter, so raw keypoint noise shows up here.
+    d_gain_yaw: float = 36
+    d_gain_strafe: float = 12
+    d_gain_ud: float = 15
+    d_gain_fb: float = 30
+
+    # caps on the risky axes, yaw and strafe only limited by the rc range
     cap_fb: float = 40
+    cap_ud: float = 40
 
     lateral_mode: Literal["yaw", "strafe", "mix"] = "mix"
     mix_split: float = 0.2  # |x error| where the blend is half yaw, half strafe
@@ -107,34 +114,50 @@ def _clamp(v, lo, hi):
 
 
 class Axis:
-    def __init__(self, gain: float, cap: float, deadzone: float):
+    def __init__(self, gain: float, deadzone: float, d_gain: float = 0.0, cap: float = RC_MAX):
         self.gain = gain
-        self.cap = cap
+        self.d_gain = d_gain
         self.deadzone = deadzone
+        self.cap = min(cap, RC_MAX)
 
-    def update(self, err: float) -> int:
+    def update(self, err: float, derr: float = 0.0) -> int:
+        # d term opposes how fast the error changes, so it brakes when closing in
         if abs(err) < self.deadzone:
             cmd = 0.0
         else:
-            cmd = _clamp(self.gain * err, -self.cap, self.cap)
+            cmd = max(-self.cap, min(self.cap, self.gain * err + self.d_gain * derr))
         return int(round(cmd))
 
 
 class PersonTracker:
     def __init__(self, cfg: TrackerConfig):
         self.cfg = cfg
-        self.yaw_axis = Axis(cfg.gain_yaw, cfg.cap_yaw, 0.0)
-        self.strafe_axis = Axis(cfg.gain_strafe, cfg.cap_strafe, 0.0)
-        self.ud_axis = Axis(cfg.gain_ud, cfg.cap_ud, cfg.dz_y)
-        self.fb_axis = Axis(cfg.gain_fb, cfg.cap_fb, cfg.dz_size)
+        self.yaw_axis = Axis(cfg.gain_yaw, 0.0, cfg.d_gain_yaw)
+        self.strafe_axis = Axis(cfg.gain_strafe, 0.0, cfg.d_gain_strafe)
+        self.ud_axis = Axis(cfg.gain_ud, cfg.dz_y, cfg.d_gain_ud, cfg.cap_ud)
+        self.fb_axis = Axis(cfg.gain_fb, cfg.dz_size, cfg.d_gain_fb, cfg.cap_fb)
         self.state = "idle"
         self._last_seen = None  # time of last fresh measurement
         self._last_ex = 0.0  # x error of last fresh measurement, for search dir
+        self._prev_err = None  # (t, errors) of the last measurement, for the d terms
 
     def reset(self):
         self._last_seen = None
         self._last_ex = 0.0
+        self._prev_err = None
         self.state = "idle"
+
+    def _rates(self, t: float, errors: tuple[float, ...]) -> tuple[float, ...]:
+        # how fast each error changes, per second. 0 on the first frame and after a gap
+        # longer than stale_s, so there are no slopes across a dropout.
+        rates = tuple(0.0 for _ in errors)
+        if self._prev_err is not None:
+            prev_t, prev_errors = self._prev_err
+            dt = t - prev_t
+            if 0 < dt <= self.cfg.stale_s:
+                rates = tuple((e - p) / dt for e, p in zip(errors, prev_errors))
+        self._prev_err = (t, errors)
+        return rates
 
     def update(self, m: Measurement | None, now: float, height_cm: float):
         cfg = self.cfg
@@ -144,6 +167,7 @@ class PersonTracker:
             if self._last_seen is None:
                 self._last_seen = now
             lost_for = now - self._last_seen
+            self._prev_err = None
             if lost_for < cfg.lost_freeze_s:
                 self.state = "frozen"
                 return 0, 0, 0, 0
@@ -159,21 +183,24 @@ class PersonTracker:
         es = cfg.target_size - m.size  # positive: person too far away
         self._last_ex = ex
 
-        # x errors inside the deadzone are zero, then split by lateral mode
+        # rates from the raw errors, before the deadzones zero them out
+        dex, dey, des = self._rates(m.t, (ex, ey, es))
+
+        # x errors inside the deadzone are zero, then split by lateral mode.
+        # the x rate is split with the same weight as the x error.
         if abs(ex) < cfg.dz_x:
             ex = 0.0
         if cfg.lateral_mode == "yaw":
-            yaw_err, strafe_err = ex, 0.0
+            w = 1.0
         elif cfg.lateral_mode == "strafe":
-            yaw_err, strafe_err = 0.0, ex
+            w = 0.0
         else:
             w = _clamp(abs(ex) / (2 * cfg.mix_split), 0.0, 1.0)
-            yaw_err, strafe_err = w * ex, (1 - w) * ex
 
-        left_right = self.strafe_axis.update(strafe_err)
-        yaw = self.yaw_axis.update(yaw_err)
-        forward_backward = self.fb_axis.update(es)
-        up_down = self.ud_axis.update(ey)
+        left_right = self.strafe_axis.update((1 - w) * ex, (1 - w) * dex)
+        yaw = self.yaw_axis.update(w * ex, w * dex)
+        forward_backward = self.fb_axis.update(es, des)
+        up_down = self.ud_axis.update(ey, dey)
 
         # keep the drone in the altitude band
         if height_cm <= cfg.min_alt_cm:
