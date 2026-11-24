@@ -1,6 +1,5 @@
 import logging
 import time
-from pathlib import Path
 
 import cv2
 from djitellopy import Tello
@@ -9,9 +8,8 @@ from inference import VideoFrameInference
 
 logger = logging.getLogger(__name__)
 
-VIDEO_DIR = Path(__file__).parent / "videos"
-RECORD_FPS = 30
-INTERVAL = 1 / RECORD_FPS
+STREAM_FPS = 30
+INTERVAL = 1 / STREAM_FPS
 PLACEHOLDER_SHAPE = (
     300,
     400,

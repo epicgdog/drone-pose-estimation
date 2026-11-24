@@ -11,8 +11,7 @@ from pydantic import BaseModel
 
 from euro_filter import EuroFilter
 from inference import VideoFrameInference, YOLOTestCoco
-from main import RECORD_FPS, VIDEO_DIR, wait_for_real_frame
-from pose_video import render_video
+from main import wait_for_real_frame
 
 logger = logging.getLogger(__name__)
 
@@ -277,54 +276,6 @@ class LiftWorker:
                 self.output.set((pose, time.monotonic()))
 
 
-
-class Recorder:
-    # own thread: writes the raw camera frames at a fixed fps so the video plays back in
-    # real time (frames repeat if the stream lags). the 3d pose is rendered after landing.
-    def __init__(self, frame_read, fps: float = RECORD_FPS):
-        self.frame_read = frame_read
-        self.fps = fps
-        h, w = frame_read.frame.shape[:2]
-        self.size = (w, h)
-        VIDEO_DIR.mkdir(exist_ok=True)
-        self.path = VIDEO_DIR / time.strftime("tello-track-%Y%m%d-%H%M%S.mp4")
-        self.writer = cv2.VideoWriter(
-            str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), fps, self.size
-        )
-        if not self.writer.isOpened():
-            raise RuntimeError(f"Could not open VideoWriter for {self.path}")
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="record", daemon=True)
-
-    def start(self):
-        logger.info("recording to %s", self.path)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        self._thread.join(timeout=2)
-        self.writer.release()
-        logger.info("saved recording %s", self.path)
-
-    def _run(self):
-        interval = 1.0 / self.fps
-        next_t = time.monotonic()
-        while not self._stop.is_set():
-            try:
-                frame = self.frame_read.frame
-                if frame is not None and (frame.shape[1], frame.shape[0]) == self.size:
-                    self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            except Exception:
-                # never let recording take down tracking
-                logger.exception("recording frame failed")
-            next_t += interval
-            delay = next_t - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_t = time.monotonic()  # fell behind, don't try to catch up
-
-
 def describe(cmd) -> str:
     # rc command -> what the drone is doing, in words
     left_right, forward_backward, up_down, yaw = cmd
@@ -448,16 +399,6 @@ def main():
         help="how x error is handled: turn, strafe, or a blend (default mix)",
     )
     parser.add_argument(
-        "--no-record",
-        action="store_true",
-        help="don't save the flight video to videos/",
-    )
-    parser.add_argument(
-        "--no-render",
-        action="store_true",
-        help="don't run the 3d pose on the recording after landing",
-    )
-    parser.add_argument(
         "--live-lift",
         action="store_true",
         help="also run the 3d lift live during flight (slows tracking, output unused for now)",
@@ -483,14 +424,10 @@ def main():
     # the laptop is the only controller: it takes off and lands. keep the phone app
     # disconnected, its stick packets fight the rc commands sent here.
     took_off = False
-    recorder = None
     try:
         wait_for_real_frame(frame_read)
         if worker is not None:
             worker.start()
-        if not args.no_record:
-            recorder = Recorder(frame_read)
-            recorder.start()
         if not args.dry_run:
             logger.info("taking off, ctrl+c to land")
             took_off = True  # set first so ctrl+c mid takeoff still lands
@@ -517,17 +454,7 @@ def main():
                 tello.land()
             except Exception:
                 logger.exception("land failed, land it from the phone app or catch it")
-        if recorder is not None:
-            recorder.stop()
         tello.streamoff()
-
-    # drone is down: now there's time for the full 3d pass on every recorded frame
-    if recorder is not None and not args.no_render:
-        logger.info("rendering 3d pose, ctrl+c to skip (run pose_video.py on it later)")
-        try:
-            render_video(recorder.path, inference=worker.inference if worker else None)
-        except KeyboardInterrupt:
-            logger.info("skipped render: uv run python3 pose_video.py %s", recorder.path)
 
 
 if __name__ == "__main__":
