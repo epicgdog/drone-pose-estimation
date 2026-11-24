@@ -38,6 +38,7 @@
 <header>
   <h1>Live pose</h1>
   <span id="conn" class="stat">connecting…</span>
+  <span class="stat">source <b id="source">–</b></span>
   <span class="stat">fps <b id="fps">–</b></span>
   <span class="stat">2d <b id="detect">–</b> ms</span>
   <span class="stat">3d lift <b id="lift">–</b> ms</span>
@@ -123,6 +124,7 @@ es.onmessage = ev => {
   show("state", d.state);
   show("cmd", d.cmd ? d.cmd.join(" / ") : null);
   show("prate", d.person_rate);
+  show("source", d.source);
   document.querySelectorAll(".track").forEach(e => e.style.display = d.state ? "" : "none");
   $("joints").textContent = d.kpts2d ? d.kpts2d.filter(k => k[2] >= KPT_CONF).length + "/17" : "–";
 };

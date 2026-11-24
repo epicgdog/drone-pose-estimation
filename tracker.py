@@ -192,8 +192,10 @@ class PersonRate:
 
 class PersonTracker:
     # forward/back and up/down: pd on the size and height errors. yaw: feedforward.
-    def __init__(self, cfg: TrackerConfig):
+    # use_ff=False keeps yaw at 0, recorded video has no real heading
+    def __init__(self, cfg: TrackerConfig, use_ff: bool = True):
         self.cfg = cfg
+        self.use_ff = use_ff
         self.ud_axis = Axis(cfg.gain_ud, cfg.dz_y, cfg.d_gain_ud, cfg.cap_ud)
         self.fb_axis = Axis(cfg.gain_fb, cfg.dz_size, cfg.d_gain_fb, cfg.cap_fb)
         self.heading = HeadingBuffer()
@@ -264,7 +266,7 @@ class PersonTracker:
         # rates from the raw errors, before the deadzones zero them out
         dey, des = self._rates(m.t, ey, es)
 
-        yaw = self._ff_yaw(m)
+        yaw = self._ff_yaw(m) if self.use_ff else 0
         forward_backward = self.fb_axis.update(es, des)
         up_down = self._alt_band(self.ud_axis.update(ey, dey), height_cm)
 
