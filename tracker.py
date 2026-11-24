@@ -9,7 +9,6 @@ import numpy as np
 from djitellopy import Tello
 from pydantic import BaseModel
 
-from euro_filter import EuroFilter
 from inference import VideoFrameInference, YOLOTestCoco
 from main import wait_for_real_frame
 
@@ -23,7 +22,6 @@ class TrackerConfig(BaseModel):
     # measurement
     kpt_conf: float = 0.3  # joints below this score are ignored
     target_size: float = 0.25  # wanted torso size, fraction of frame height
-    outlier_jump: float = 0.4  # reject size jumps bigger than this fraction
 
     # deadzones, errors inside these are treated as zero
     dz_x: float = 0.05
@@ -63,7 +61,7 @@ class Measurement(BaseModel):
     t: float  # time.monotonic()
 
 
-def measure(kpts, scores, frame_shape, cfg: TrackerConfig) -> Measurement | None:
+def measure(kpts, scores, frame_shape, cfg: TrackerConfig, t: float | None = None) -> Measurement | None:
     # kpts: (17, 2) pixels, scores: (17,), frame_shape: (h, w)
     h, w = frame_shape[:2]
 
@@ -100,48 +98,8 @@ def measure(kpts, scores, frame_shape, cfg: TrackerConfig) -> Measurement | None
         # hips only, no way to get a size
         return None
 
-    return Measurement(cx=float(cx), cy=float(cy), size=float(size), t=time.monotonic())
-
-
-class MeasurementFilter:
-    MAX_REJECTS = 5  # after this many rejects in a row, accept the jump
-
-    def __init__(self, cfg: TrackerConfig):
-        self.cfg = cfg
-        self.euro = EuroFilter()
-        self.prev_size = None  # size of the last accepted measurement
-        self.prev_t = None  # time of the last accepted measurement
-        self.rejects = 0
-
-    def reset(self):
-        self.euro = EuroFilter()
-        self.prev_size = None
-        self.prev_t = None
-        self.rejects = 0
-
-    def update(self, m: Measurement | None) -> Measurement | None:
-        if m is None:
-            return None
-
-        # reject size jumps, unless it keeps happening (person really moved)
-        if self.prev_size is not None and self.prev_size > 0:
-            jump = abs(m.size - self.prev_size) / self.prev_size
-            if jump > self.cfg.outlier_jump and self.rejects < self.MAX_REJECTS:
-                self.rejects += 1
-                logger.debug("rejected size jump %.2f", jump)
-                return None
-        self.rejects = 0
-        self.prev_size = m.size
-
-        # one euro filter, sample rate from the time between accepted measurements
-        if self.prev_t is not None:
-            dt = m.t - self.prev_t
-            if dt > 0:
-                self.euro.set_rate(1.0 / dt)
-        self.prev_t = m.t
-
-        cx, cy, size = self.euro.filter(np.array([m.cx, m.cy, m.size], dtype=np.float64))
-        return Measurement(cx=float(cx), cy=float(cy), size=float(size), t=m.t)
+    t = time.monotonic() if t is None else t
+    return Measurement(cx=float(cx), cy=float(cy), size=float(size), t=t)
 
 
 def _clamp(v, lo, hi):
@@ -343,7 +301,6 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
     cfg = TrackerConfig(lateral_mode=args.lateral)
     yolo = YOLOTestCoco(device="mps")
     yolo.setup_runtime()
-    mfilter = MeasurementFilter(cfg)
     tracker = PersonTracker(cfg)
     events = EventLog()
 
@@ -358,13 +315,12 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
         # rgb to bgr since opencv and yolo expect bgr.
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
+        t_frame = time.monotonic()  # when we got the frame, before inference
         det = yolo._detect_best_person(bgr)
         m = None
-        if det is None:
-            mfilter.reset()
-        else:
-            raw = measure(det.keypoints, det.scores, bgr.shape, cfg)
-            m = mfilter.update(raw)
+        if det is not None:
+            # raw measurement straight to the controller, no smoothing
+            m = measure(det.keypoints, det.scores, bgr.shape, cfg, t=t_frame)
             if m is not None and worker is not None:
                 worker.input.set((det.keypoints, det.scores, bgr.shape[:2]))
 
@@ -378,7 +334,6 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
         else:
             # on the ground: send nothing, start fresh once airborne
             tracker.reset()
-            mfilter.reset()
             cmd = None
             state = "idle"
 
