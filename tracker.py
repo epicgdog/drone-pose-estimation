@@ -1,6 +1,7 @@
 import argparse
 import csv
 import logging
+import math
 import threading
 import time
 from pathlib import Path
@@ -52,6 +53,17 @@ class TrackerConfig(BaseModel):
 
     lateral_mode: Literal["yaw", "strafe", "mix"] = "mix"
     mix_split: float = 0.2  # |x error| where the blend is half yaw, half strafe
+
+    # yaw feedforward (--ff). constants measured with calibrate.py on 2026-11-21.
+    ff_enabled: bool = False
+    video_latency_s: float = 0.085  # video frame behind the heading state
+    hfov_deg: float = 53.0  # camera horizontal field of view
+    rc_deadband: float = 12  # rc yaw below this barely turns the drone
+    rc_per_dps: float = 1.0  # rc yaw per deg/s above the deadband
+    ff_window_s: float = 0.2  # person rate is the bearing slope over this window
+    ff_gain: float = 0.8  # under 1 so the drone overshoots less when the person stops
+    ff_kp: float = 4.0  # deg/s per deg the person is past the deadzone edge
+    ff_min_dps: float = 3.0  # wanted turn rates below this are zero (rate noise)
 
     # lost person handling
     hold_s: float = 0.3  # on a dropout, repeat the last command this long
@@ -131,6 +143,58 @@ class Axis:
         return int(round(cmd))
 
 
+class HeadingBuffer:
+    # recent drone headings, unwrapped, so we can ask what the heading was when an
+    # older video frame was captured. get_yaw() is whole degrees and only changes when
+    # a state packet arrives, so only the moments it changed are kept.
+    KEEP_S = 2.0
+
+    def __init__(self):
+        self.samples = []  # (t, heading deg)
+        self._offset = 0.0
+        self._last_raw = None
+
+    def add(self, t: float, raw_deg: float):
+        if self._last_raw is not None:
+            d = raw_deg - self._last_raw
+            if d > 180:
+                self._offset -= 360
+            elif d < -180:
+                self._offset += 360
+        if raw_deg != self._last_raw or not self.samples:
+            self.samples.append((t, raw_deg + self._offset))
+        self._last_raw = raw_deg
+        while len(self.samples) > 2 and self.samples[1][0] < t - self.KEEP_S:
+            self.samples.pop(0)
+
+    def at(self, t: float) -> float | None:
+        if not self.samples:
+            return None
+        ts = [s[0] for s in self.samples]
+        hs = [s[1] for s in self.samples]
+        return float(np.interp(t, ts, hs))
+
+
+class PersonRate:
+    # person's bearing in the world (drone heading + angle in the image) and how fast
+    # it changes, deg/s. works whether the drone or the person is the one moving.
+    def __init__(self, window_s: float):
+        self.window_s = window_s
+        self.points = []  # (t, bearing deg)
+
+    def reset(self):
+        self.points = []
+
+    def update(self, t: float, bearing: float) -> float:
+        self.points.append((t, bearing))
+        self.points = [p for p in self.points if p[0] >= t - self.window_s]
+        if len(self.points) < 4 or self.points[-1][0] - self.points[0][0] < 0.5 * self.window_s:
+            return 0.0  # not enough history yet
+        ts = np.array([p[0] for p in self.points])
+        bs = np.array([p[1] for p in self.points])
+        return float(np.polyfit(ts - ts[0], bs, 1)[0])
+
+
 class PersonTracker:
     def __init__(self, cfg: TrackerConfig):
         self.cfg = cfg
@@ -138,6 +202,9 @@ class PersonTracker:
         self.strafe_axis = Axis(cfg.gain_strafe, 0.0, cfg.d_gain_strafe)
         self.ud_axis = Axis(cfg.gain_ud, cfg.dz_y, cfg.d_gain_ud, cfg.cap_ud)
         self.fb_axis = Axis(cfg.gain_fb, cfg.dz_size, cfg.d_gain_fb, cfg.cap_fb)
+        self.heading = HeadingBuffer()
+        self.person_rate = PersonRate(cfg.ff_window_s)
+        self.debug = {}  # feedforward internals for the frame log
         self.state = "idle"
         self._last_seen = None  # time of last fresh measurement
         self._last_cmd = None  # last tracking command, repeated on short dropouts
@@ -147,6 +214,7 @@ class PersonTracker:
         self._last_seen = None
         self._last_cmd = None
         self._prev_err = None
+        self.person_rate.reset()
         self.state = "idle"
 
     def _alt_band(self, up_down: int, height_cm: float) -> int:
@@ -169,8 +237,12 @@ class PersonTracker:
         self._prev_err = (t, errors)
         return rates
 
-    def update(self, m: Measurement | None, now: float, height_cm: float):
+    def update(self, m: Measurement | None, now: float, height_cm: float,
+               heading_deg: float | None = None):
         cfg = self.cfg
+        self.debug = {}
+        if heading_deg is not None:
+            self.heading.add(now, heading_deg)
         fresh = m is not None and now - m.t <= cfg.stale_s
 
         if not fresh:
@@ -186,6 +258,7 @@ class PersonTracker:
 
             self._last_cmd = None
             self._prev_err = None
+            self.person_rate.reset()
             # no person: hover in place, never spin looking for one
             self.state = "frozen"
             return 0, 0, 0, 0
@@ -213,11 +286,41 @@ class PersonTracker:
 
         left_right = self.strafe_axis.update((1 - w) * ex, (1 - w) * dex)
         yaw = self.yaw_axis.update(w * ex, w * dex)
+        if cfg.ff_enabled:
+            left_right = 0
+            yaw = self._ff_yaw(m)
         forward_backward = self.fb_axis.update(es, des)
         up_down = self._alt_band(self.ud_axis.update(ey, dey), height_cm)
 
         self._last_cmd = (left_right, forward_backward, up_down, yaw)
         return self._last_cmd
+
+    def _ff_yaw(self, m: Measurement) -> int:
+        # wanted turn rate = person's own rate (feedforward) + a push back toward the
+        # center when they're past the deadzone edge. then deg/s -> rc with the deadband.
+        cfg = self.cfg
+        half = math.tan(math.radians(cfg.hfov_deg / 2))
+        angle = math.degrees(math.atan((m.cx - 0.5) * 2 * half))  # + is right of center
+
+        head = self.heading.at(m.t - cfg.video_latency_s)  # heading when frame was shot
+        rate = 0.0
+        if head is not None:
+            bearing = head + angle
+            rate = self.person_rate.update(m.t, bearing)
+            self.debug.update(heading=head, bearing=bearing)
+
+        dz_deg = cfg.dz_x * cfg.hfov_deg
+        past = math.copysign(max(0.0, abs(angle) - dz_deg), angle)  # 0 inside, ramps outside
+        want = cfg.ff_gain * rate + cfg.ff_kp * past
+
+        if abs(want) < cfg.ff_min_dps:
+            yaw = 0
+        else:
+            rc = cfg.rc_deadband + abs(want) * cfg.rc_per_dps
+            yaw = int(round(math.copysign(min(rc, RC_MAX), want)))
+        self.debug.update(person_rate=rate, want_dps=want)
+        return yaw
+
 
 
 class LatestSlot:
@@ -332,7 +435,8 @@ class EventLog:
 
 class FrameLog:
     COLUMNS = ["t", "frame_ms", "infer_ms", "reason", "state", "cx", "size", "ex",
-               "lr", "fb", "ud", "yaw", "height_cm"]
+               "lr", "fb", "ud", "yaw", "height_cm",
+               "heading", "bearing", "person_rate", "want_dps"]
 
     def __init__(self):
         LOG_DIR.mkdir(exist_ok=True)
@@ -346,7 +450,7 @@ class FrameLog:
         self._window = []  # rows since the last summary
         logger.info("frame log: %s", self.path)
 
-    def row(self, now, infer_ms, reason, state, m, cmd, height):
+    def row(self, now, infer_ms, reason, state, m, cmd, height, debug=None):
         frame_ms = (now - self._last_t) * 1000 if self._last_t is not None else 0.0
         self._last_t = now
         lr, fb, ud, yaw = cmd if cmd is not None else (0, 0, 0, 0)
@@ -355,6 +459,8 @@ class FrameLog:
             f"{now - self._t0:.3f}", f"{frame_ms:.1f}", f"{infer_ms:.1f}", reason, state,
             f"{m.cx:.3f}" if m else "", f"{m.size:.3f}" if m else "",
             f"{ex:.3f}" if ex is not None else "", lr, fb, ud, yaw, height,
+            *(f"{debug[k]:.2f}" if debug and k in debug else ""
+              for k in ("heading", "bearing", "person_rate", "want_dps")),
         ])
         self._window.append((infer_ms, reason, ex, yaw))
         if now - self._window_start >= 1.0:
@@ -382,7 +488,10 @@ class FrameLog:
 
 def track(tello, frame_read, args, worker: LiftWorker | None, until: float | None = None):
     # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
-    cfg = TrackerConfig(lateral_mode=args.lateral)
+    if args.ff and args.lateral != "yaw":
+        logger.info("--ff turns with yaw only, ignoring --lateral %s", args.lateral)
+    cfg = TrackerConfig(lateral_mode="yaw" if args.ff else args.lateral, ff_enabled=args.ff)
+    logger.info("lateral %s, feedforward %s", cfg.lateral_mode, "on" if cfg.ff_enabled else "off")
     yolo = YOLOTestCoco(device="mps")
     yolo.setup_runtime()
     tracker = PersonTracker(cfg)
@@ -425,7 +534,7 @@ def _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, ev
         height = tello.get_height()
         now = time.monotonic()
         if height > cfg.airborne_cm:
-            cmd = tracker.update(m, now, height)
+            cmd = tracker.update(m, now, height, heading_deg=tello.get_yaw())
             if not args.dry_run:
                 tello.send_rc_control(*cmd)
             state = tracker.state
@@ -435,7 +544,7 @@ def _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, ev
             cmd = None
             state = "idle"
 
-        frames.row(now, infer_ms, reason, state, m, cmd, height)
+        frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug)
         # a hold is a blip inside tracking, not a state change worth logging
         events.update("tracking" if state == "holding" else state, m, cmd)
 
@@ -452,6 +561,11 @@ def main():
         choices=["yaw", "strafe", "mix"],
         default="mix",
         help="how x error is handled: turn, strafe, or a blend (default mix)",
+    )
+    parser.add_argument(
+        "--ff",
+        action="store_true",
+        help="yaw feedforward: turn at the person's measured rate (implies --lateral yaw)",
     )
     parser.add_argument(
         "--live-lift",
