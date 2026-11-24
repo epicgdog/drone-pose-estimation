@@ -38,6 +38,10 @@
   #controls .panel { padding: 12px; }
   #controls h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
   .lifter-pick label { display: block; padding: 3px 0; cursor: pointer; }
+  #land { margin-top: 16px; width: 100%; padding: 10px; border: 0; border-radius: 6px;
+          background: #7a2b2b; color: var(--text); font: inherit; font-weight: 600; cursor: pointer; }
+  #land.armed { background: var(--bad); }
+  #land:disabled { opacity: 0.6; cursor: default; }
   #gains { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 18px; }
   .gain { display: grid; grid-template-columns: 90px 1fr 44px; gap: 8px; align-items: center; }
   .gain span { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
@@ -75,6 +79,7 @@
   <div class="panel">
     <h3>3d lifters</h3>
     <div class="lifter-pick" id="lifterpick"></div>
+    <button id="land" type="button">Land</button>
     <div id="ctlmsg"></div>
   </div>
   <div class="panel">
@@ -214,7 +219,22 @@ function showControls(c) {
     row.querySelector("output").textContent = +(+v).toFixed(3);
     row.classList.toggle("changed", v !== defaults[name]);
   }
+  if (c.landing) { landBtn.textContent = "Landing…"; landBtn.disabled = true; }
 }
+
+// land takes two clicks so a stray click can't end the flight
+const landBtn = $("land");
+let armTimer = null;
+landBtn.onclick = () => {
+  if (!landBtn.classList.contains("armed")) {
+    landBtn.classList.add("armed"); landBtn.textContent = "Click again to land";
+    armTimer = setTimeout(() => { landBtn.classList.remove("armed"); landBtn.textContent = "Land"; }, 3000);
+    return;
+  }
+  clearTimeout(armTimer);
+  landBtn.classList.remove("armed");
+  control({ action: "land" });
+};
 
 fetch("/meta").then(r => r.json()).then(m => buildControls(m.controls))
   .catch(() => { msg.textContent = "could not load controls"; });

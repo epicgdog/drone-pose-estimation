@@ -6,7 +6,7 @@
     uv run python3 main.py --lifters both        # start with flo and fmpose3d side by side
 
 The dashboard always runs at http://127.0.0.1:8000: camera, 2d + 3d pose, commands, and
-controls to switch lifters and change gains. ctrl+c in the terminal lands.
+controls to switch lifters, change gains, and land. ctrl+c in the terminal always lands too.
 
 Each frame: yolo 2d -> measure the person -> tracker picks an rc command -> send it.
 Forward/back and up/down are pd controlled, yaw is feedforward. The pieces live in tracker.py.
@@ -166,6 +166,9 @@ def track(drone, frame_read, args, workers: dict[str, LiftWorker], until: float 
         while until is None or time.monotonic() < until:
             if frame_read.stopped:
                 break  # video ended, or the tello stream stopped
+            if controls.land.is_set():
+                logger.info("landing, asked from the dashboard")
+                break
             frame = frame_read.frame
             if frame is None or frame is last_frame:
                 time.sleep(0.005)
@@ -278,7 +281,7 @@ def main():
         wait_for_real_frame(frame_read)
         for w in workers.values():
             w.start()
-        logger.info("taking off, ctrl+c to land")
+        logger.info("taking off, ctrl+c or the dashboard to land")
         took_off = True  # set first so ctrl+c mid takeoff still lands
         drone.takeoff()
         until = None

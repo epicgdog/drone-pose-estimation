@@ -3,6 +3,7 @@
 main.py runs the loop and calls LiveServer.publish() every frame. The page can:
   - pick which 3d lifters run (flo, fmpose3d, or both)
   - change the tunable gains (tracker.TUNABLES) mid-flight
+  - ask the drone to land (ctrl+c in the terminal always works too)
 Each frame goes to the page as a server-sent event: jpeg + 2d keypoints + latest 3d poses.
 """
 
@@ -38,6 +39,7 @@ class Controls:
         self.tunables = dict(tunables)
         self._values = {k: values[k] for k in self.tunables}
         self._pending = {}  # gain changes the loop hasn't applied yet
+        self.land = threading.Event()
 
     def active(self) -> list[str]:
         with self._lock:
@@ -75,6 +77,7 @@ class Controls:
                 "values": dict(self._values),
                 "tunables": {k: {"min": lo, "max": hi, "step": st}
                              for k, (lo, hi, st) in self.tunables.items()},
+                "landing": self.land.is_set(),
             }
 
 
@@ -140,7 +143,7 @@ def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
         for name, s in skeletons.items()
     }
     # only this page may send controls. another site open in the browser could otherwise
-    # post to 127.0.0.1 and change gains.
+    # post to 127.0.0.1 and land the drone or change gains.
     own_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
     class Handler(BaseHTTPRequestHandler):
@@ -163,7 +166,7 @@ def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
                 self._send(404, "text/plain", b"not found")
 
         def do_POST(self):
-            # body: {"lifters": [...]} | {"set": name, "value": v}
+            # body: {"lifters": [...]} | {"set": name, "value": v} | {"action": "land"}
             if self.path != "/control":
                 return self._send(404, "text/plain", b"not found")
             if self.headers.get("Origin") not in own_origins:
@@ -180,6 +183,10 @@ def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
                     controls.set_active(req["lifters"])
                 elif "set" in req:
                     controls.set_value(req["set"], req["value"])
+                elif req.get("action") == "land":
+                    if not controls.land.is_set():
+                        logger.info("land requested from the dashboard")
+                    controls.land.set()
                 else:
                     raise ValueError("unknown request")
             except (ValueError, TypeError, KeyError, AttributeError) as e:
