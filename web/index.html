@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Pose</title>
+<style>
+  :root {
+    --bg: #111418; --panel: #1a1f25; --text: #e6e8eb; --muted: #8b939c;
+    --left: #00a0ff; --right: #ffa000; --mid: #c8c8c8; --ok: #4caf50; --bad: #e57373;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { display: flex; gap: 20px; align-items: baseline; padding: 12px 16px; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .stat { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stat b { color: var(--text); font-weight: 500; }
+  #conn.ok { color: var(--ok); } #conn.bad { color: var(--bad); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 0 16px 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border-radius: 8px; overflow: hidden; position: relative; }
+  .panel h2 { position: absolute; top: 8px; left: 12px; margin: 0; font-size: 13px;
+              color: var(--muted); font-weight: 500; z-index: 1; pointer-events: none; }
+  #video { width: 100%; height: auto; display: block; }
+  /* the canvas is absolutely positioned so its pixel size can't change the panel size
+     (otherwise resize -> taller canvas -> taller panel -> resize, doubling forever) */
+  #three { width: 100%; aspect-ratio: 4 / 3; position: relative; overflow: hidden; }
+  #three canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .hint { position: absolute; bottom: 8px; right: 12px; font-size: 12px; color: var(--muted);
+          pointer-events: none; }
+  #nopose { position: absolute; inset: 0; display: grid; place-items: center;
+            color: var(--muted); pointer-events: none; }
+
+  /* controls */
+  #controls { display: grid; grid-template-columns: 220px 1fr; gap: 12px; padding: 0 16px 16px; }
+  @media (max-width: 900px) { #controls { grid-template-columns: 1fr; } }
+  #controls .panel { padding: 12px; }
+  #controls h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
+  .lifter-pick label { display: block; padding: 3px 0; cursor: pointer; }
+  #land { margin-top: 16px; width: 100%; padding: 10px; border: 0; border-radius: 6px;
+          background: #7a2b2b; color: var(--text); font: inherit; font-weight: 600; cursor: pointer; }
+  #land.armed { background: var(--bad); }
+  #land:disabled { opacity: 0.6; cursor: default; }
+  #gains { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 18px; }
+  .gain { display: grid; grid-template-columns: 90px 1fr 44px; gap: 8px; align-items: center; }
+  .gain span { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+  .gain output { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .gain.changed span { color: var(--text); }
+  #ctlmsg { color: var(--bad); font-size: 12px; min-height: 1.4em; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live pose</h1>
+  <span id="conn" class="stat">connecting…</span>
+  <span class="stat">source <b id="source">–</b></span>
+  <span class="stat">fps <b id="fps">–</b></span>
+  <span class="stat">2d <b id="detect">–</b> ms</span>
+  <span class="stat">3d lift <b id="lift">–</b> ms</span>
+  <span class="stat">joints <b id="joints">–</b></span>
+  <span class="stat track">state <b id="state">–</b></span>
+  <span class="stat track">rc lr/fb/ud/yaw <b id="cmd">–</b></span>
+  <span class="stat track">person <b id="prate">–</b> °/s</span>
+</header>
+<main>
+  <div class="panel">
+    <h2>camera + 2d pose (coco-17)</h2>
+    <canvas id="video" width="960" height="720"></canvas>
+  </div>
+  <div class="panel">
+    <h2 id="title3d">3d pose</h2>
+    <div id="three"></div>
+    <div id="nopose">no 3d pose</div>
+    <div class="hint">drag to orbit · scroll to zoom</div>
+  </div>
+</main>
+<section id="controls">
+  <div class="panel">
+    <h3>3d lifters</h3>
+    <div class="lifter-pick" id="lifterpick"></div>
+    <button id="land" type="button">Land</button>
+    <div id="ctlmsg"></div>
+  </div>
+  <div class="panel">
+    <h3>gains (applied on the next frame, logged in the frame csv)</h3>
+    <div id="gains"></div>
+  </div>
+</section>
+
+<script>
+// camera, 2d skeleton and the stream live in a plain script, so the video keeps
+// working even if the 3d view (three.js module below) fails to load.
+const css = getComputedStyle(document.documentElement);
+const COLOR = { left: css.getPropertyValue("--left").trim(),
+                right: css.getPropertyValue("--right").trim(),
+                mid: css.getPropertyValue("--mid").trim() };
+const KPT_CONF = 0.3;
+
+// ---------- 2d ----------
+// coco-17: odd indices are the person's left, even their right, 0 nose
+const COCO_BONES = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,11],[6,12],[11,12],
+                    [5,7],[7,9],[6,8],[8,10],[11,13],[13,15],[12,14],[14,16]];
+const side2d = j => j === 0 ? "mid" : (j % 2 ? "left" : "right");
+
+const canvas = document.getElementById("video");
+const ctx = canvas.getContext("2d");
+const img = new Image();
+let pending2d = null;
+img.onload = () => {
+  if (canvas.width !== img.width) { canvas.width = img.width; canvas.height = img.height; }
+  ctx.drawImage(img, 0, 0);
+  const k = pending2d;
+  if (!k) return;
+  const lw = Math.max(2, canvas.width / 320);
+  ctx.lineWidth = lw; ctx.lineCap = "round";
+  for (const [a, b] of COCO_BONES) {
+    if (k[a][2] < KPT_CONF || k[b][2] < KPT_CONF) continue;
+    const sa = side2d(a), sb = side2d(b);
+    ctx.strokeStyle = COLOR[sa === sb ? sa : "mid"];
+    ctx.beginPath(); ctx.moveTo(k[a][0], k[a][1]); ctx.lineTo(k[b][0], k[b][1]); ctx.stroke();
+  }
+  ctx.fillStyle = "#fff";
+  for (const [x, y, s] of k) {
+    if (s < KPT_CONF) continue;
+    ctx.beginPath(); ctx.arc(x, y, lw * 1.4, 0, Math.PI * 2); ctx.fill();
+  }
+};
+
+// ---------- stream ----------
+const $ = id => document.getElementById(id);
+const conn = $("conn");
+const frameTimes = [];  // page-side fps when the source doesn't send one
+const es = new EventSource("/events");
+es.onopen = () => { conn.textContent = "live"; conn.className = "stat ok"; };
+es.onerror = () => { conn.textContent = "disconnected, retrying…"; conn.className = "stat bad"; };
+es.onmessage = ev => {
+  let d;
+  try { d = JSON.parse(ev.data); } catch (e) { return; }
+  if (!d || !d.img) return;  // skip empty or partial messages instead of crashing
+  pending2d = d.kpts2d;
+  img.src = "data:image/jpeg;base64," + d.img;
+  if (window.setPose3d) window.setPose3d(d.poses3d || {});
+  const show = (id, v) => { $(id).textContent = v ?? "–"; };
+  frameTimes.push(performance.now());
+  while (frameTimes.length && frameTimes[0] < performance.now() - 1000) frameTimes.shift();
+  show("fps", d.fps ?? frameTimes.length);
+  show("detect", d.detect_ms);
+  // lift_ms: {lifter: ms}
+  const lm = d.lift_ms && typeof d.lift_ms === "object"
+    ? Object.entries(d.lift_ms).map(([n, ms]) => `${n} ${ms}`).join(" · ") : d.lift_ms;
+  show("lift", lm);
+  show("state", d.state);
+  show("cmd", d.cmd ? d.cmd.join(" / ") : null);
+  show("prate", d.person_rate);
+  show("source", d.source);
+  if (window.setActiveLifters && d.active) window.setActiveLifters(d.active);
+  document.querySelectorAll(".track").forEach(e => e.style.display = d.state ? "" : "none");
+  $("joints").textContent = d.kpts2d ? d.kpts2d.filter(k => k[2] >= KPT_CONF).length + "/17" : "–";
+};
+
+// ---------- controls ----------
+// every change goes to POST /control. the server clamps values and answers with the
+// current controls, which is what the page then shows.
+const msg = $("ctlmsg");
+let defaults = {};  // values at page load, to mark changed gains
+async function control(body) {
+  try {
+    const r = await fetch("/control", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    msg.textContent = r.ok ? "" : (d.error || `request failed (${r.status})`);
+    if (d.controls) showControls(d.controls);
+  } catch (e) {
+    msg.textContent = "no connection to main.py";
+  }
+}
+
+const lifterOptions = names => [
+  ...names.map(n => ({ label: n, value: [n] })),
+  ...(names.length > 1 ? [{ label: "both", value: names }] : []),
+];
+
+function buildControls(c) {
+  defaults = { ...c.values };
+  const pick = $("lifterpick");
+  for (const opt of lifterOptions(c.lifters)) {
+    const l = document.createElement("label");
+    const r = document.createElement("input");
+    r.type = "radio"; r.name = "lifters"; r.value = opt.value.join(",");
+    r.onchange = () => control({ lifters: opt.value });
+    l.append(r, " " + opt.label);
+    pick.append(l);
+  }
+  const gains = $("gains");
+  for (const [name, t] of Object.entries(c.tunables)) {
+    const row = document.createElement("label");
+    row.className = "gain"; row.id = "gain-" + name;
+    const span = document.createElement("span"); span.textContent = name; span.title = name;
+    const input = document.createElement("input");
+    input.type = "range"; input.min = t.min; input.max = t.max; input.step = t.step;
+    const out = document.createElement("output");
+    input.oninput = () => { out.textContent = +(+input.value).toFixed(3); };
+    input.onchange = () => control({ set: name, value: +input.value });  // on release
+    row.append(span, input, out);
+    gains.append(row);
+  }
+  showControls(c);
+}
+
+function showControls(c) {
+  const key = c.active.join(",");
+  document.querySelectorAll("input[name=lifters]").forEach(r => r.checked = r.value === key);
+  for (const [name, v] of Object.entries(c.values)) {
+    const row = $("gain-" + name);
+    if (!row) continue;
+    const input = row.querySelector("input");
+    if (document.activeElement !== input) input.value = v;
+    row.querySelector("output").textContent = +(+v).toFixed(3);
+    row.classList.toggle("changed", v !== defaults[name]);
+  }
+  if (c.landing) { landBtn.textContent = "Landing…"; landBtn.disabled = true; }
+}
+
+// land takes two clicks so a stray click can't end the flight
+const landBtn = $("land");
+let armTimer = null;
+landBtn.onclick = () => {
+  if (!landBtn.classList.contains("armed")) {
+    landBtn.classList.add("armed"); landBtn.textContent = "Click again to land";
+    armTimer = setTimeout(() => { landBtn.classList.remove("armed"); landBtn.textContent = "Land"; }, 3000);
+    return;
+  }
+  clearTimeout(armTimer);
+  landBtn.classList.remove("armed");
+  control({ action: "land" });
+};
+
+fetch("/meta").then(r => r.json()).then(m => buildControls(m.controls))
+  .catch(() => { msg.textContent = "could not load controls"; });
+
+// the 3d module registers window.setPose3d once three.js has loaded
+setTimeout(() => {
+  if (!window.setPose3d) document.getElementById("nopose").textContent =
+    "3d view failed to load (three.js), check the browser console";
+}, 5000);
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "/vendor/three.module.js"
+} }
+</script>
+<script type="module">
+// three.js 0.160.0 comes from node_modules (npm install), served by live_view.py
+import * as THREE from "three";
+import { OrbitControls } from "/vendor/OrbitControls.js";
+
+const css = getComputedStyle(document.documentElement);
+const COLOR = { left: css.getPropertyValue("--left").trim(),
+                right: css.getPropertyValue("--right").trim(),
+                mid: css.getPropertyValue("--mid").trim() };
+const KPT_CONF = 0.3;
+
+// ---------- 3d ----------
+const holder = document.getElementById("three");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+holder.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(css.getPropertyValue("--panel").trim());
+const camera = new THREE.PerspectiveCamera(45, 4 / 3, 0.01, 50);
+camera.position.set(1.8, 1.2, 2.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+controls.enableDamping = true;
+scene.add(new THREE.GridHelper(4, 16, 0x3a424c, 0x262c33));
+scene.add(new THREE.AxesHelper(0.3));
+
+const meta = await (await fetch("/meta")).json();
+const names = Object.keys(meta.lifters);  // every loaded lifter, e.g. ["flo", "fmpose3d"]
+const SPACING = 1.2;  // meters between skeletons, side by side along x
+
+const jointGeo = new THREE.SphereGeometry(0.025, 12, 8);
+const jointMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+function makeLabel() {
+  const c = document.createElement("canvas"); c.width = 512; c.height = 96;
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }));
+  sprite.scale.set(0.8, 0.15, 1);
+  let last = null;
+  sprite.setText = (text, ok) => {
+    if (text === last) return;
+    last = text;
+    const g = c.getContext("2d");
+    g.clearRect(0, 0, c.width, c.height);
+    g.font = "500 44px -apple-system, BlinkMacSystemFont, sans-serif";
+    g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillStyle = ok ? "#e6e8eb" : "#8b939c";
+    g.fillText(text, c.width / 2, c.height / 2);
+    tex.needsUpdate = true;
+  };
+  return sprite;
+}
+
+// one skeleton per lifter, each built from its own bone list (coco-17 and h36m-17 differ)
+const views = names.map((name, i) => {
+  const m = meta.lifters[name];
+  const left = new Set(m.left), right = new Set(m.right);
+  const side3d = (a, b) => (left.has(a) && left.has(b)) ? "left"
+                         : (right.has(a) && right.has(b)) ? "right" : "mid";
+  const group = new THREE.Group();
+  scene.add(group);
+  const joints = Array.from({ length: 17 }, () => {
+    const s = new THREE.Mesh(jointGeo, jointMat); group.add(s); return s;
+  });
+  const bones = m.bones.map(([a, b]) => {
+    const geo = new THREE.BufferGeometry().setAttribute(
+      "position", new THREE.Float32BufferAttribute(new Float32Array(6), 3));
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: COLOR[side3d(a, b)] }));
+    group.add(line);
+    return { a, b, line };
+  });
+  const label = makeLabel();
+  label.position.set(0, 2.05, 0);
+  group.add(label);
+  return { name, group, joints, bones, label, parts: [...joints, ...bones.map(b => b.line)] };
+});
+
+// only the running lifters are shown, laid out side by side
+let activeKey = null;
+function setActive(active) {
+  const key = active.join(",");
+  if (key === activeKey) return;
+  activeKey = key;
+  const shown = views.filter(v => active.includes(v.name));
+  views.forEach(v => v.group.visible = false);
+  shown.forEach((v, i) => {
+    v.group.visible = true;
+    v.group.position.x = (i - (shown.length - 1) / 2) * SPACING;
+  });
+  document.getElementById("title3d").textContent = "3d pose (" +
+    shown.map(v => `${v.name}, ${meta.lifters[v.name].skeleton}-17`).join(" | ") + ")";
+  if (shown.length > 1) camera.position.set(0.5, 1.4, 3.6);
+  else camera.position.set(1.8, 1.2, 2.4);
+}
+setActive(meta.controls.active);
+const nopose = document.getElementById("nopose");
+
+function setView(view, p) {
+  const has = Array.isArray(p) && p.length === 17;
+  view.parts.forEach(o => o.visible = has);
+  view.label.setText(has ? view.name : `${view.name}: no 3d pose`, has);
+  if (!has) return false;
+  // lifter output: meters, z up, root at the origin. three.js: y up. feet on the grid.
+  const minZ = Math.min(...p.map(q => q[2]));
+  const v = p.map(([x, y, z]) => new THREE.Vector3(x, z - minZ, -y));
+  v.forEach((q, i) => view.joints[i].position.copy(q));
+  for (const { a, b, line } of view.bones) {
+    const pos = line.geometry.attributes.position;
+    pos.setXYZ(0, v[a].x, v[a].y, v[a].z); pos.setXYZ(1, v[b].x, v[b].y, v[b].z);
+    pos.needsUpdate = true;
+  }
+  return true;
+}
+
+// poses: {lifter name: (17, 3) pose or null}. each lifter shows or hides on its own.
+function setPose(poses) {
+  let any = false;
+  for (const view of views) {
+    if (view.group.visible) any = setView(view, (poses || {})[view.name]) || any;
+  }
+  nopose.style.display = any ? "none" : "grid";
+}
+setPose({});
+
+function resize() {
+  const w = holder.clientWidth, h = Math.round(w * 3 / 4);  // from width only, never from content
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(holder);
+resize();
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+window.setPose3d = setPose;
+window.setActiveLifters = setActive;
+</script>
+</body>
+</html>

@@ -1,64 +1,67 @@
-import time
+import os
 
-import numpy as np
-from fmpose3d import FMPose3DInference
-from fmpose3d.lib.preprocess import h36m_coco_format
+# fmpose3d fetches its weights through hugging face, which checks online on every start.
+# the tello's wifi has no internet, so use the cached copy (~/.cache/huggingface) only.
+# set before anything imports huggingface_hub. to download the weights the first time:
+#   HF_HUB_OFFLINE=0 uv run python3 main.py --video <some.mp4>
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+import numpy as np  # noqa: E402  (after the env var on purpose)
 from numpy.typing import NDArray
-from pydantic import BaseModel, ConfigDict
-from ultralytics import YOLO
+from pydantic import BaseModel, ConfigDict  # noqa: E402
+from ultralytics import YOLO  # noqa: E402
 
-from euro_filter import EuroFilter
+from flo_model.shim import FloInference, Result2D  # noqa: E402
 
-NUM_JOINTS = 17  # COCO and H36M both use 17 joints
 
-# H36M 17-joint topology: 0 hip, 1-3 right leg, 4-6 left leg, 7 spine,
-# 8 thorax, 9 nose, 10 head, 11-13 left arm, 14-16 right arm.
-BONES = [
-    (0, 1),  # hip - r_hip
-    (1, 2),  # r_hip - r_knee
-    (2, 3),  # r_knee - r_foot
-    (0, 4),  # hip - l_hip
-    (4, 5),  # l_hip - l_knee
-    (5, 6),  # l_knee - l_foot
-    (0, 7),  # hip - spine
-    (7, 8),  # spine - thorax
-    (8, 9),  # thorax - nose
-    (9, 10),  # nose - head
-    (8, 11),  # thorax - l_shoulder
-    (11, 12),  # l_shoulder - l_elbow
-    (12, 13),  # l_elbow - l_wrist
-    (8, 14),  # thorax - r_shoulder
-    (14, 15),  # r_shoulder - r_elbow
-    (15, 16),  # r_elbow - r_wrist
-]
+NUM_JOINTS = 17
 
-# names of the joints, line up with indices of bones.
-# EX: bones[0] = hip joint, connecting 0 (hip) and 1 (lower right leg)
-JOINT_NAMES = [
-    "hip",
-    "r_hip",
-    "r_knee",
-    "r_foot",
-    "l_hip",
-    "l_knee",
-    "l_foot",
-    "spine",
-    "thorax",
-    "nose",
-    "head",
-    "l_shoulder",
-    "l_elbow",
-    "l_wrist",
-    "r_shoulder",
-    "r_elbow",
-    "r_wrist",
-]
+class COCOSkeleton:
+    """COCO 17-joint layout: what YOLO outputs and what Flo predicts (no spine/thorax/head joints).
+    0 nose, 1-2 eyes, 3-4 ears, 5-6 shoulders, 7-8 elbows, 9-10 wrists,
+    11-12 hips, 13-14 knees, 15-16 ankles. odd = person's left, even = right."""
 
-# indices for which joints are left and right sides.
-# JOINT_NAMES[1] -> r_hip
-# JOINT_NAMES[4] -> l_hip
-JOINTS_LEFT = {4, 5, 6, 11, 12, 13}
-JOINTS_RIGHT = {1, 2, 3, 14, 15, 16}
+    NAME = "coco"
+    BONES = [
+        (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6),  # face, ears to shoulders (coco has no neck)
+        (5, 6), (5, 11), (6, 12), (11, 12),  # torso
+        (5, 7), (7, 9), (6, 8), (8, 10),  # arms
+        (11, 13), (13, 15), (12, 14), (14, 16),  # legs
+    ]
+    JOINT_NAMES = [
+        "nose", "l_eye", "r_eye", "l_ear", "r_ear", "l_shoulder", "r_shoulder",
+        "l_elbow", "r_elbow", "l_wrist", "r_wrist", "l_hip", "r_hip",
+        "l_knee", "r_knee", "l_ankle", "r_ankle",
+    ]
+    JOINTS_LEFT = {1, 3, 5, 7, 9, 11, 13, 15}
+    JOINTS_RIGHT = {2, 4, 6, 8, 10, 12, 14, 16}
+    ROOT = (11, 12)  # pelvis = mean of the hips
+    FOREARMS = ((7, 9), (8, 10))  # (left elbow, wrist), (right elbow, wrist)
+
+
+class H36MSkeleton:
+    """H36M 17-joint layout: what FMPose3D predicts.
+    0 hip, 1-3 right leg, 4-6 left leg, 7 spine, 8 thorax, 9 nose, 10 head, 11-13 left arm, 14-16 right arm."""
+
+    NAME = "h36m"
+    BONES = [
+        (0, 1), (1, 2), (2, 3),  # hip - right leg
+        (0, 4), (4, 5), (5, 6),  # hip - left leg
+        (0, 7), (7, 8), (8, 9), (9, 10),  # hip - spine - thorax - nose - head
+        (8, 11), (11, 12), (12, 13),  # thorax - left arm
+        (8, 14), (14, 15), (15, 16),  # thorax - right arm
+    ]
+    JOINT_NAMES = [
+        "hip", "r_hip", "r_knee", "r_foot", "l_hip", "l_knee", "l_foot", "spine", "thorax",
+        "nose", "head", "l_shoulder", "l_elbow", "l_wrist", "r_shoulder", "r_elbow", "r_wrist",
+    ]
+    JOINTS_LEFT = {4, 5, 6, 11, 12, 13}
+    JOINTS_RIGHT = {1, 2, 3, 14, 15, 16}
+    ROOT = 0  # hip joint
+    FOREARMS = ((12, 13), (15, 16))
+
+
+SKELETONS = {"flo": COCOSkeleton, "fmpose3d": H36MSkeleton}  # backend -> its 3d joint layout
 
 
 # result of a yolo predict type, assuming one person is detected
@@ -71,7 +74,7 @@ class PersonDetection(BaseModel):
 
 # class to load in our own custom 2d pose estimator.
 # these classes need a setup_runtime method and a predict method so that
-# fmpose3d api can use it.
+# the Flo lifter (flo_model) can use it as its 2d estimator.
 class YOLOTestCoco:
     # default is the CoreML FP16 export (runs on the Neural Engine, ~1.6x faster
     # than the .pt on mps). create it once with:
@@ -124,55 +127,82 @@ class YOLOTestCoco:
             coco_kpts[0, i] = person.keypoints
             coco_scores[0, i] = person.scores
 
-        # h36m_coco_format drops the person entirely when all frames are empty
-        h36m_kpts, h36m_scores, _ = h36m_coco_format(coco_kpts, coco_scores)
-        if h36m_kpts.shape[0] == 0:
-            h36m_kpts = np.zeros((1, n, NUM_JOINTS, 2), dtype=np.float32)
-            h36m_scores = np.zeros((1, n, NUM_JOINTS), dtype=np.float32)
-
         # this mask basically is of every frame and if they have valid scores or not.
-        valid_frames_mask = np.any(h36m_scores > 0, axis=(0, 2))
-        return h36m_kpts, h36m_scores, valid_frames_mask
+        valid_frames_mask = np.any(coco_scores > 0, axis=(0, 2))
+        return coco_kpts, coco_scores, valid_frames_mask
 
 
 class VideoFrameInference:
-    def __init__(self, device=None, weights=None, seed=0):
-        self.device = device  # torch device, e.g. cpu / mps / cuda
-        self.weights = weights  # 3D model .pth, None downloads from HuggingFace
-        self.seed = seed  # seed for the flow-matching sampler
+    """3d lifting. backend="flo" (default): Flo flow-matching lifter in flo_model/, cpu, coco-17 out.
+    backend="fmpose3d": FMPose3D, h36m-17 out. self.skeleton says which joint layout lift() returns."""
 
-        self.api = FMPose3DInference(
-            model_weights_path=self.weights,
-            device=self.device,
-            estimator_2d=YOLOTestCoco(),
-        )
-        # load the models once, here.
+    def __init__(self, device=None, seed=0, backend="flo"):
+        self.device = device  # torch device for fmpose3d, flo always samples on cpu
+        self.seed = seed  # seed for the flow-matching sampler
+        self.backend = backend
+
+        if backend == "flo":
+            self.skeleton = COCOSkeleton
+            self.api = FloInference(estimator_2d=YOLOTestCoco(), device="cpu", seed=seed)
+        elif backend == "fmpose3d":
+            from fmpose3d import FMPose3DInference
+
+            self.skeleton = H36MSkeleton
+            self.api = FMPose3DInference(
+                model_weights_path=None, device=device, estimator_2d=YOLOTestCoco()
+            )
+        else:
+            raise ValueError(f"unknown backend {backend!r}, expected 'flo' or 'fmpose3d'")
+        # load the models once, here. pose_3d calls setup_runtime() on every frame, and
+        # fmpose3d reloads its weights from disk each time (~40 ms). make it a no-op.
         self.api.setup_runtime()
-        # prepare_2d and pose_3d call setup_runtime() on every frame, and it
-        # reloads the 3D weights from disk each time (~40 ms). make it a no-op.
         self.api.setup_runtime = lambda: None
 
-        # euro filter
-        self.euro_filter = EuroFilter()
-        self.old_time = 0
-
-    def infer(self, frame):
-
-        result_2d = self.api.prepare_2d(frame[np.newaxis])
-        if result_2d.status.value in {"empty", "invalid"}:
+    def lift(self, coco_kpts, coco_scores, frame_shape):
+        # coco_kpts: (17, 2) pixels in the source frame, coco_scores: (17,)
+        # frame_shape: (h, w) of that frame, needed to normalize the 2d points.
+        # returns (17, 3) pose in self.skeleton's joint order, meters, root at the origin, z up
+        # (x right, y away from the camera, z up), or None if too few joints are visible.
+        kpts = np.asarray(coco_kpts, dtype=np.float32).reshape(1, 1, NUM_JOINTS, 2)
+        scores = np.asarray(coco_scores, dtype=np.float32).reshape(1, 1, NUM_JOINTS)
+        if not np.any(scores > 0):
             return None
+        image_size = (int(frame_shape[0]), int(frame_shape[1]))
+        if self.backend == "flo":
+            return self._lift_flo(kpts, scores, image_size)
+        return self._lift_fmpose3d(kpts, scores, image_size)
 
-        if self.old_time == 0:
-            # use default for the first frame
-            self.old_time = time.monotonic()
-        else:
-            curr_time = time.monotonic()
-            dt = curr_time - self.old_time
-            self.euro_filter.set_rate(1.0 / dt)
-            self.old_time = curr_time
-        result_2d.keypoints = self.euro_filter.filter(result_2d.keypoints)
-
+    def _lift_flo(self, kpts, scores, image_size):
+        result_2d = Result2D(
+            keypoints=kpts, scores=scores, image_size=image_size,
+            valid_frames_mask=np.array([True]),
+        )
         result_3d = self.api.pose_3d(result_2d, seed=self.seed)
         valid = result_3d.valid_frames_mask
         if valid is not None and not valid[0]:
             return None
+        # flo gives camera axes (x right, y down, z forward), pelvis relative
+        cam = np.asarray(result_3d.poses_3d[0], dtype=np.float64)
+        return np.stack([cam[:, 0], cam[:, 2], -cam[:, 1]], axis=1)
+
+    def _lift_fmpose3d(self, kpts, scores, image_size):
+        from fmpose3d import Pose2DResult
+        from fmpose3d.lib.preprocess import h36m_coco_format
+
+        # fmpose3d wants h36m 2d. h36m_coco_format drops the person when all keypoints are zero
+        h36m_kpts, h36m_scores, _ = h36m_coco_format(kpts, scores)
+        if h36m_kpts.shape[0] == 0:
+            return None
+        result_2d = Pose2DResult(
+            keypoints=h36m_kpts, scores=h36m_scores, image_size=image_size,
+            valid_frames_mask=np.any(h36m_scores > 0, axis=(0, 2)),
+        )
+        result_3d = self.api.pose_3d(result_2d, seed=self.seed)
+        valid = result_3d.valid_frames_mask
+        if valid is not None and not valid[0]:
+            return None
+        # turned 180 deg about z from flo's frame. rotate (not mirror) so left/right stay right.
+        pose = np.asarray(result_3d.poses_3d_world[0], dtype=np.float64)
+        pose = pose - pose[H36MSkeleton.ROOT]  # hip relative, like flo's output
+        pose[:, :2] *= -1
+        return pose

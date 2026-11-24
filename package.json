@@ -1,0 +1,8 @@
+{
+  "name": "drone-pose-dashboard",
+  "private": true,
+  "description": "three.js for the live dashboard, served by live_view.py. run npm install once while online.",
+  "dependencies": {
+    "three": "0.160.0"
+  }
+}
