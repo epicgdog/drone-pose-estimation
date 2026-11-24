@@ -22,3 +22,5 @@ videos/
 # Downloaded model weights and exports
 *.pt
 *.mlpackage/
+logs/
+LATER_PLAN.md
