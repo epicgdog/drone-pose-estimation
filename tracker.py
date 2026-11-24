@@ -1,7 +1,9 @@
 import argparse
+import csv
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Literal
 
 import cv2
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 L_SHOULDER, R_SHOULDER, L_HIP, R_HIP = 5, 6, 11, 12
 
 RC_MAX = 100  # tello rc range is -100..100
+LOG_DIR = Path("logs")  # per-frame tracking logs
 
 
 class TrackerConfig(BaseModel):
@@ -327,6 +330,56 @@ class EventLog:
             logger.info("on the ground, tracking idle")
 
 
+class FrameLog:
+    COLUMNS = ["t", "frame_ms", "infer_ms", "reason", "state", "cx", "size", "ex",
+               "lr", "fb", "ud", "yaw", "height_cm"]
+
+    def __init__(self):
+        LOG_DIR.mkdir(exist_ok=True)
+        self.path = LOG_DIR / time.strftime("track_%Y%m%d_%H%M%S.csv")
+        self._file = open(self.path, "w", newline="")
+        self._csv = csv.writer(self._file)
+        self._csv.writerow(self.COLUMNS)
+        self._t0 = time.monotonic()
+        self._last_t = None
+        self._window_start = self._t0
+        self._window = []  # rows since the last summary
+        logger.info("frame log: %s", self.path)
+
+    def row(self, now, infer_ms, reason, state, m, cmd, height):
+        frame_ms = (now - self._last_t) * 1000 if self._last_t is not None else 0.0
+        self._last_t = now
+        lr, fb, ud, yaw = cmd if cmd is not None else (0, 0, 0, 0)
+        ex = m.cx - 0.5 if m is not None else None
+        self._csv.writerow([
+            f"{now - self._t0:.3f}", f"{frame_ms:.1f}", f"{infer_ms:.1f}", reason, state,
+            f"{m.cx:.3f}" if m else "", f"{m.size:.3f}" if m else "",
+            f"{ex:.3f}" if ex is not None else "", lr, fb, ud, yaw, height,
+        ])
+        self._window.append((infer_ms, reason, ex, yaw))
+        if now - self._window_start >= 1.0:
+            self._summary(now)
+
+    def _summary(self, now):
+        rows = self._window
+        fps = len(rows) / (now - self._window_start)
+        infer = sum(r[0] for r in rows) / len(rows)
+        counts = {}
+        for r in rows:
+            counts[r[1]] = counts.get(r[1], 0) + 1
+        exs = [abs(r[2]) for r in rows if r[2] is not None]
+        mean_ex = f"{sum(exs) / len(exs):.2f}" if exs else "-"
+        mean_yaw = sum(abs(r[3]) for r in rows) / len(rows)
+        reasons = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        logger.info("%.1f fps  infer %.0f ms  |ex| %s  |yaw| %.0f  %s",
+                    fps, infer, mean_ex, mean_yaw, reasons)
+        self._window = []
+        self._window_start = now
+
+    def close(self):
+        self._file.close()
+
+
 def track(tello, frame_read, args, worker: LiftWorker | None, until: float | None = None):
     # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
     cfg = TrackerConfig(lateral_mode=args.lateral)
@@ -334,7 +387,14 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
     yolo.setup_runtime()
     tracker = PersonTracker(cfg)
     events = EventLog()
+    frames = FrameLog()
+    try:
+        _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, events, frames)
+    finally:
+        frames.close()
 
+
+def _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, events, frames):
     last_frame = None
 
     while until is None or time.monotonic() < until:
@@ -348,12 +408,19 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
 
         t_frame = time.monotonic()  # when we got the frame, before inference
         det = yolo._detect_best_person(bgr)
+        infer_ms = (time.monotonic() - t_frame) * 1000
         m = None
-        if det is not None:
+        if det is None:
+            reason = "no_person"
+        else:
             # raw measurement straight to the controller, no smoothing
             m = measure(det.keypoints, det.scores, bgr.shape, cfg, t=t_frame)
-            if m is not None and worker is not None:
-                worker.input.set((det.keypoints, det.scores, bgr.shape[:2]))
+            if m is None:
+                reason = "no_torso"  # person found, but shoulders/hips too unsure
+            else:
+                reason = "ok"
+                if worker is not None:
+                    worker.input.set((det.keypoints, det.scores, bgr.shape[:2]))
 
         height = tello.get_height()
         now = time.monotonic()
@@ -368,6 +435,7 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
             cmd = None
             state = "idle"
 
+        frames.row(now, infer_ms, reason, state, m, cmd, height)
         # a hold is a blip inside tracking, not a state change worth logging
         events.update("tracking" if state == "holding" else state, m, cmd)
 
