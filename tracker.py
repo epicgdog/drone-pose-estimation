@@ -11,6 +11,7 @@ import numpy as np
 from djitellopy import Tello
 from pydantic import BaseModel
 
+from euro_filter import EuroFilter
 from inference import VideoFrameInference, YOLOTestCoco
 from main import wait_for_real_frame
 
@@ -306,13 +307,15 @@ class LatestSlot:
 
 
 class LiftWorker:
-    def __init__(self, inference: VideoFrameInference):
+    def __init__(self, inference: VideoFrameInference, name: str = "lift"):
         self.inference = inference
+        self.name = name  # backend name, e.g. flo / fmpose3d
         self.input = LatestSlot()  # (kpts, scores, frame_shape)
         self.output = LatestSlot()  # (newest 3d pose (17, 3), time.monotonic() it was made)
         self.count = 0  # successful lifts, for fps logging
+        self.lift_ms = 0.0  # duration of the last lift
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="lift", daemon=True)
+        self._thread = threading.Thread(target=self._run, name=f"lift-{name}", daemon=True)
 
     def start(self):
         self._thread.start()
@@ -329,15 +332,43 @@ class LiftWorker:
                 continue
             last = item
             kpts, scores, frame_shape = item
+            t = time.monotonic()
             try:
                 pose = self.inference.lift(kpts, scores, frame_shape)
             except Exception:
                 # never let lifting take down tracking
-                logger.exception("lift failed")
+                logger.exception("%s lift failed", self.name)
                 continue
+            self.lift_ms = (time.monotonic() - t) * 1000
             self.count += 1
             if pose is not None:
                 self.output.set((pose, time.monotonic()))
+
+
+
+LIFT_STALE_S = 0.5  # 3d poses older than this aren't shown or logged
+
+
+class LiftStats:
+    # per-lifter jitter (m) and forearm lengths (m) for the frame log, to compare lifters
+    def __init__(self, worker: LiftWorker):
+        self.worker = worker
+        self.forearms = worker.inference.skeleton.FOREARMS
+        self._prev = None  # previous pose
+        self._prev_t = None  # its timestamp
+
+    def update(self, now) -> tuple[str, str, str]:
+        out = self.worker.output.get()
+        if out is None or out[1] == self._prev_t or now - out[1] >= LIFT_STALE_S:
+            return "", "", ""  # nothing new this frame
+        pose, t = out
+        jitter = ""
+        if self._prev is not None and t - self._prev_t < LIFT_STALE_S:
+            jitter = f"{np.linalg.norm(pose - self._prev, axis=1).mean():.4f}"
+        self._prev, self._prev_t = pose, t
+        (le, lw), (re, rw) = self.forearms
+        return (jitter, f"{np.linalg.norm(pose[le] - pose[lw]):.4f}",
+                f"{np.linalg.norm(pose[re] - pose[rw]):.4f}")
 
 
 def describe(cmd) -> str:
@@ -403,19 +434,20 @@ class FrameLog:
                "lr", "fb", "ud", "yaw", "height_cm",
                "heading", "bearing", "person_rate", "want_dps"]
 
-    def __init__(self):
+    def __init__(self, lifters=()):
+        self.lift_columns = [f"{n}_{c}" for n in lifters for c in ("jitter", "l_forearm", "r_forearm")]
         LOG_DIR.mkdir(exist_ok=True)
         self.path = LOG_DIR / time.strftime("track_%Y%m%d_%H%M%S.csv")
         self._file = open(self.path, "w", newline="")
         self._csv = csv.writer(self._file)
-        self._csv.writerow(self.COLUMNS)
+        self._csv.writerow(self.COLUMNS + self.lift_columns)
         self._t0 = time.monotonic()
         self._last_t = None
         self._window_start = self._t0
         self._window = []  # rows since the last summary
         logger.info("frame log: %s", self.path)
 
-    def row(self, now, infer_ms, reason, state, m, cmd, height, debug=None):
+    def row(self, now, infer_ms, reason, state, m, cmd, height, debug=None, lift=()):
         frame_ms = (now - self._last_t) * 1000 if self._last_t is not None else 0.0
         self._last_t = now
         lr, fb, ud, yaw = cmd if cmd is not None else (0, 0, 0, 0)
@@ -426,6 +458,7 @@ class FrameLog:
             f"{ex:.3f}" if ex is not None else "", lr, fb, ud, yaw, height,
             *(f"{debug[k]:.2f}" if debug and k in debug else ""
               for k in ("heading", "bearing", "person_rate", "want_dps")),
+            *lift,
         ])
         self._window.append((infer_ms, reason, ex, yaw))
         if now - self._window_start >= 1.0:
@@ -451,21 +484,27 @@ class FrameLog:
         self._file.close()
 
 
-def track(tello, frame_read, args, worker: LiftWorker | None, until: float | None = None):
+def track(tello, frame_read, args, workers: dict[str, LiftWorker] | None = None,
+          until: float | None = None):
     # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
+    workers = workers or {}
     cfg = TrackerConfig()
     yolo = YOLOTestCoco(device="mps")
     yolo.setup_runtime()
     tracker = PersonTracker(cfg)
     events = EventLog()
-    frames = FrameLog()
+    frames = FrameLog(lifters=list(workers))
     try:
-        _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, events, frames)
+        _track_frames(tello, frame_read, args, workers, until, cfg, yolo, tracker, events, frames)
     finally:
         frames.close()
 
 
-def _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, events, frames):
+def _track_frames(tello, frame_read, args, workers, until, cfg, yolo, tracker, events, frames):
+    # one euro filter on the 2d keypoints for the 3d lift only.
+    # control (measure -> tracker) keeps using the raw keypoints, no added lag.
+    euro2d, last_t2d = EuroFilter(), None
+    stats = [LiftStats(w) for w in workers.values()]
     last_frame = None
 
     while until is None or time.monotonic() < until:
@@ -480,18 +519,26 @@ def _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, ev
         t_frame = time.monotonic()  # when we got the frame, before inference
         det = yolo._detect_best_person(bgr)
         infer_ms = (time.monotonic() - t_frame) * 1000
+        k2d = None  # smoothed keypoints for the lift
+        if det is None:
+            euro2d, last_t2d = EuroFilter(), None  # person gone, don't smooth across the gap
+        else:
+            if last_t2d is not None and t_frame > last_t2d:
+                euro2d.set_rate(1.0 / (t_frame - last_t2d))
+            last_t2d = t_frame
+            k2d = euro2d.filter(det.keypoints.astype(np.float64)).astype(np.float32)
         m = None
         if det is None:
             reason = "no_person"
         else:
-            # raw measurement straight to the controller, no smoothing
             m = measure(det.keypoints, det.scores, bgr.shape, cfg, t=t_frame)
             if m is None:
                 reason = "no_torso"  # person found, but shoulders/hips too unsure
             else:
                 reason = "ok"
-                if worker is not None:
-                    worker.input.set((det.keypoints, det.scores, bgr.shape[:2]))
+                item = (k2d, det.scores, bgr.shape[:2])  # same 2d for every lifter
+                for w in workers.values():
+                    w.input.set(item)
 
         height = tello.get_height()
         now = time.monotonic()
@@ -506,7 +553,8 @@ def _track_frames(tello, frame_read, args, worker, until, cfg, yolo, tracker, ev
             cmd = None
             state = "idle"
 
-        frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug)
+        lift = [v for s in stats for v in s.update(now)]
+        frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug, lift)
         # a hold is a blip inside tracking, not a state change worth logging
         events.update("tracking" if state == "holding" else state, m, cmd)
 
@@ -524,6 +572,12 @@ def main():
         help="also run the 3d lift live during flight (slows tracking, output unused for now)",
     )
     parser.add_argument(
+        "--lifters",
+        choices=["flo", "fmpose3d", "both"],
+        default="flo",
+        help="3d lifter(s) for --live-lift: flo, fmpose3d, or both side by side (default flo)",
+    )
+    parser.add_argument(
         "--flight-s",
         type=float,
         default=60,
@@ -532,7 +586,12 @@ def main():
     args = parser.parse_args()
 
     logger.info("Starting up!")
-    worker = LiftWorker(VideoFrameInference(device="mps")) if args.live_lift else None
+    workers = {}
+    if args.live_lift:
+        names = ["flo", "fmpose3d"] if args.lifters == "both" else [args.lifters]
+        for name in names:
+            # flo samples on cpu, fmpose3d on mps (yolo is on the neural engine)
+            workers[name] = LiftWorker(VideoFrameInference(device="mps", backend=name), name)
 
     tello = Tello()
     tello.connect()
@@ -546,8 +605,8 @@ def main():
     took_off = False
     try:
         wait_for_real_frame(frame_read)
-        if worker is not None:
-            worker.start()
+        for w in workers.values():
+            w.start()
         if not args.dry_run:
             logger.info("taking off, ctrl+c to land")
             took_off = True  # set first so ctrl+c mid takeoff still lands
@@ -556,14 +615,14 @@ def main():
         if not args.dry_run and args.flight_s > 0:
             until = time.monotonic() + args.flight_s
             logger.info("landing in %.0f s", args.flight_s)
-        track(tello, frame_read, args, worker, until)
+        track(tello, frame_read, args, workers, until)
         if until is not None:
             logger.info("flight time up, landing")
     except KeyboardInterrupt:
         logger.info("interrupted, %s", "landing" if took_off else "stopping")
     finally:
-        if worker is not None:
-            worker.stop()
+        for w in workers.values():
+            w.stop()
         if not args.dry_run:
             try:
                 tello.send_rc_control(0, 0, 0, 0)
