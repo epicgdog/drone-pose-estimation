@@ -5,7 +5,6 @@ import math
 import threading
 import time
 from pathlib import Path
-from typing import Literal
 
 import cv2
 import numpy as np
@@ -30,32 +29,24 @@ class TrackerConfig(BaseModel):
     target_size: float = 0.25  # wanted torso size, fraction of frame height
 
     # deadzones, errors inside these are treated as zero
-    dz_x: float = 0.05
+    dz_x: float = 0.05  # yaw: no centering push inside this, see _ff_yaw
     dz_y: float = 0.08
     dz_size: float = 0.03
 
-    # gains, command units per unit error
-    gain_yaw: float = 360
-    gain_strafe: float = 120
+    # pd gains for forward/back and up/down, command units per unit error
     gain_ud: float = 150
     gain_fb: float = 300
 
     # d gains, command units per (unit error per second). about 0.1 s of
     # lookahead: d_gain / gain. no filter, so raw keypoint noise shows up here.
-    d_gain_yaw: float = 36
-    d_gain_strafe: float = 12
     d_gain_ud: float = 15
     d_gain_fb: float = 30
 
-    # caps on the risky axes, yaw and strafe only limited by the rc range
+    # caps on forward/back and up/down, yaw only limited by the rc range
     cap_fb: float = 40
     cap_ud: float = 40
 
-    lateral_mode: Literal["yaw", "strafe", "mix"] = "mix"
-    mix_split: float = 0.2  # |x error| where the blend is half yaw, half strafe
-
-    # yaw feedforward (--ff). constants measured with calibrate.py on 2026-11-21.
-    ff_enabled: bool = False
+    # yaw feedforward. constants measured with calibrate.py on 2026-11-21.
     video_latency_s: float = 0.085  # video frame behind the heading state
     hfov_deg: float = 53.0  # camera horizontal field of view
     rc_deadband: float = 12  # rc yaw below this barely turns the drone
@@ -121,10 +112,6 @@ def measure(kpts, scores, frame_shape, cfg: TrackerConfig, t: float | None = Non
 
     t = time.monotonic() if t is None else t
     return Measurement(cx=float(cx), cy=float(cy), size=float(size), t=t)
-
-
-def _clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
 
 class Axis:
@@ -196,10 +183,9 @@ class PersonRate:
 
 
 class PersonTracker:
+    # forward/back and up/down: pd on the size and height errors. yaw: feedforward.
     def __init__(self, cfg: TrackerConfig):
         self.cfg = cfg
-        self.yaw_axis = Axis(cfg.gain_yaw, 0.0, cfg.d_gain_yaw)
-        self.strafe_axis = Axis(cfg.gain_strafe, 0.0, cfg.d_gain_strafe)
         self.ud_axis = Axis(cfg.gain_ud, cfg.dz_y, cfg.d_gain_ud, cfg.cap_ud)
         self.fb_axis = Axis(cfg.gain_fb, cfg.dz_size, cfg.d_gain_fb, cfg.cap_fb)
         self.heading = HeadingBuffer()
@@ -208,7 +194,7 @@ class PersonTracker:
         self.state = "idle"
         self._last_seen = None  # time of last fresh measurement
         self._last_cmd = None  # last tracking command, repeated on short dropouts
-        self._prev_err = None  # (t, errors) of the last measurement, for the d terms
+        self._prev_err = None  # (t, ey, es) of the last measurement, for the d terms
 
     def reset(self):
         self._last_seen = None
@@ -225,17 +211,16 @@ class PersonTracker:
             up_down = min(up_down, 0)
         return up_down
 
-    def _rates(self, t: float, errors: tuple[float, ...]) -> tuple[float, ...]:
-        # how fast each error changes, per second. 0 on the first frame and after a gap
-        # longer than stale_s, so there are no slopes across a dropout.
-        rates = tuple(0.0 for _ in errors)
+    def _rates(self, t: float, ey: float, es: float) -> tuple[float, float]:
+        # per second. 0 after a gap longer than stale_s, so no slopes across a dropout.
+        dey = des = 0.0
         if self._prev_err is not None:
-            prev_t, prev_errors = self._prev_err
+            prev_t, prev_ey, prev_es = self._prev_err
             dt = t - prev_t
             if 0 < dt <= self.cfg.stale_s:
-                rates = tuple((e - p) / dt for e, p in zip(errors, prev_errors))
-        self._prev_err = (t, errors)
-        return rates
+                dey, des = (ey - prev_ey) / dt, (es - prev_es) / dt
+        self._prev_err = (t, ey, es)
+        return dey, des
 
     def update(self, m: Measurement | None, now: float, height_cm: float,
                heading_deg: float | None = None):
@@ -266,33 +251,16 @@ class PersonTracker:
         self.state = "tracking"
         self._last_seen = m.t
 
-        ex = m.cx - 0.5  # positive: person right of center
         ey = 0.5 - m.cy  # positive: person above center
         es = cfg.target_size - m.size  # positive: person too far away
-
         # rates from the raw errors, before the deadzones zero them out
-        dex, dey, des = self._rates(m.t, (ex, ey, es))
+        dey, des = self._rates(m.t, ey, es)
 
-        # x errors inside the deadzone are zero, then split by lateral mode.
-        # the x rate is split with the same weight as the x error.
-        if abs(ex) < cfg.dz_x:
-            ex = 0.0
-        if cfg.lateral_mode == "yaw":
-            w = 1.0
-        elif cfg.lateral_mode == "strafe":
-            w = 0.0
-        else:
-            w = _clamp(abs(ex) / (2 * cfg.mix_split), 0.0, 1.0)
-
-        left_right = self.strafe_axis.update((1 - w) * ex, (1 - w) * dex)
-        yaw = self.yaw_axis.update(w * ex, w * dex)
-        if cfg.ff_enabled:
-            left_right = 0
-            yaw = self._ff_yaw(m)
+        yaw = self._ff_yaw(m)
         forward_backward = self.fb_axis.update(es, des)
         up_down = self._alt_band(self.ud_axis.update(ey, dey), height_cm)
 
-        self._last_cmd = (left_right, forward_backward, up_down, yaw)
+        self._last_cmd = (0, forward_backward, up_down, yaw)
         return self._last_cmd
 
     def _ff_yaw(self, m: Measurement) -> int:
@@ -320,7 +288,6 @@ class PersonTracker:
             yaw = int(round(math.copysign(min(rc, RC_MAX), want)))
         self.debug.update(person_rate=rate, want_dps=want)
         return yaw
-
 
 
 class LatestSlot:
@@ -375,12 +342,10 @@ class LiftWorker:
 
 def describe(cmd) -> str:
     # rc command -> what the drone is doing, in words
-    left_right, forward_backward, up_down, yaw = cmd
+    _, forward_backward, up_down, yaw = cmd
     moves = []
     if yaw:
         moves.append("turn right" if yaw > 0 else "turn left")
-    if left_right:
-        moves.append("strafe right" if left_right > 0 else "strafe left")
     if forward_backward:
         moves.append("closer" if forward_backward > 0 else "back off")
     if up_down:
@@ -488,10 +453,7 @@ class FrameLog:
 
 def track(tello, frame_read, args, worker: LiftWorker | None, until: float | None = None):
     # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
-    if args.ff and args.lateral != "yaw":
-        logger.info("--ff turns with yaw only, ignoring --lateral %s", args.lateral)
-    cfg = TrackerConfig(lateral_mode="yaw" if args.ff else args.lateral, ff_enabled=args.ff)
-    logger.info("lateral %s, feedforward %s", cfg.lateral_mode, "on" if cfg.ff_enabled else "off")
+    cfg = TrackerConfig()
     yolo = YOLOTestCoco(device="mps")
     yolo.setup_runtime()
     tracker = PersonTracker(cfg)
@@ -555,17 +517,6 @@ def main():
         "--dry-run",
         action="store_true",
         help="compute and log commands, never send them to the drone",
-    )
-    parser.add_argument(
-        "--lateral",
-        choices=["yaw", "strafe", "mix"],
-        default="mix",
-        help="how x error is handled: turn, strafe, or a blend (default mix)",
-    )
-    parser.add_argument(
-        "--ff",
-        action="store_true",
-        help="yaw feedforward: turn at the person's measured rate (implies --lateral yaw)",
     )
     parser.add_argument(
         "--live-lift",
