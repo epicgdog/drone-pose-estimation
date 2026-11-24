@@ -33,10 +33,16 @@
             color: var(--muted); pointer-events: none; }
 
   /* controls */
-  #controls { display: grid; grid-template-columns: 220px; gap: 12px; padding: 0 16px 16px; }
+  #controls { display: grid; grid-template-columns: 220px 1fr; gap: 12px; padding: 0 16px 16px; }
+  @media (max-width: 900px) { #controls { grid-template-columns: 1fr; } }
   #controls .panel { padding: 12px; }
   #controls h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
   .lifter-pick label { display: block; padding: 3px 0; cursor: pointer; }
+  #gains { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 18px; }
+  .gain { display: grid; grid-template-columns: 90px 1fr 44px; gap: 8px; align-items: center; }
+  .gain span { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+  .gain output { text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .gain.changed span { color: var(--text); }
   #ctlmsg { color: var(--bad); font-size: 12px; min-height: 1.4em; margin-top: 6px; }
 </style>
 </head>
@@ -70,6 +76,10 @@
     <h3>3d lifters</h3>
     <div class="lifter-pick" id="lifterpick"></div>
     <div id="ctlmsg"></div>
+  </div>
+  <div class="panel">
+    <h3>gains (applied on the next frame, logged in the frame csv)</h3>
+    <div id="gains"></div>
   </div>
 </section>
 
@@ -145,9 +155,10 @@ es.onmessage = ev => {
 };
 
 // ---------- controls ----------
-// every change goes to POST /control. the server answers with the current controls,
-// which is what the page then shows.
+// every change goes to POST /control. the server clamps values and answers with the
+// current controls, which is what the page then shows.
 const msg = $("ctlmsg");
+let defaults = {};  // values at page load, to mark changed gains
 async function control(body) {
   try {
     const r = await fetch("/control", { method: "POST",
@@ -166,6 +177,7 @@ const lifterOptions = names => [
 ];
 
 function buildControls(c) {
+  defaults = { ...c.values };
   const pick = $("lifterpick");
   for (const opt of lifterOptions(c.lifters)) {
     const l = document.createElement("label");
@@ -175,12 +187,33 @@ function buildControls(c) {
     l.append(r, " " + opt.label);
     pick.append(l);
   }
+  const gains = $("gains");
+  for (const [name, t] of Object.entries(c.tunables)) {
+    const row = document.createElement("label");
+    row.className = "gain"; row.id = "gain-" + name;
+    const span = document.createElement("span"); span.textContent = name; span.title = name;
+    const input = document.createElement("input");
+    input.type = "range"; input.min = t.min; input.max = t.max; input.step = t.step;
+    const out = document.createElement("output");
+    input.oninput = () => { out.textContent = +(+input.value).toFixed(3); };
+    input.onchange = () => control({ set: name, value: +input.value });  // on release
+    row.append(span, input, out);
+    gains.append(row);
+  }
   showControls(c);
 }
 
 function showControls(c) {
   const key = c.active.join(",");
   document.querySelectorAll("input[name=lifters]").forEach(r => r.checked = r.value === key);
+  for (const [name, v] of Object.entries(c.values)) {
+    const row = $("gain-" + name);
+    if (!row) continue;
+    const input = row.querySelector("input");
+    if (document.activeElement !== input) input.value = v;
+    row.querySelector("output").textContent = +(+v).toFixed(3);
+    row.classList.toggle("changed", v !== defaults[name]);
+  }
 }
 
 fetch("/meta").then(r => r.json()).then(m => buildControls(m.controls))

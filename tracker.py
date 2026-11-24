@@ -64,6 +64,25 @@ class TrackerConfig(BaseModel):
     airborne_cm: float = 30
 
 
+# dashboard sliders: name -> (min, max, step). measured constants stay fixed, caps stop at 60.
+TUNABLES = {
+    "target_size": (0.10, 0.50, 0.01),
+    "dz_x": (0.0, 0.20, 0.01),
+    "dz_y": (0.0, 0.20, 0.01),
+    "dz_size": (0.0, 0.10, 0.005),
+    "gain_fb": (0, 600, 10),
+    "d_gain_fb": (0, 100, 1),
+    "cap_fb": (0, 60, 5),
+    "gain_ud": (0, 400, 5),
+    "d_gain_ud": (0, 60, 1),
+    "cap_ud": (0, 60, 5),
+    "ff_gain": (0.0, 1.5, 0.05),
+    "ff_kp": (0.0, 10.0, 0.25),
+    "ff_min_dps": (0.0, 10.0, 0.5),
+    "ff_window_s": (0.10, 0.50, 0.05),
+}
+
+
 def wait_for_real_frame(frame_read):
     deadline = time.perf_counter() + FRAME_TIMEOUT
     while time.perf_counter() < deadline:
@@ -212,6 +231,12 @@ class PersonTracker:
         self._prev_err = None
         self.person_rate.reset()
         self.state = "idle"
+
+    def set_config(self, cfg: TrackerConfig):
+        self.cfg = cfg
+        self.ud_axis = Axis(cfg.gain_ud, cfg.dz_y, cfg.d_gain_ud, cfg.cap_ud)
+        self.fb_axis = Axis(cfg.gain_fb, cfg.dz_size, cfg.d_gain_fb, cfg.cap_fb)
+        self.person_rate.window_s = cfg.ff_window_s
 
     def _alt_band(self, up_down: int, height_cm: float) -> int:
         # keep the drone in the altitude band
@@ -441,7 +466,7 @@ class EventLog:
 class FrameLog:
     COLUMNS = ["t", "frame_ms", "infer_ms", "reason", "state", "cx", "size", "ex",
                "lr", "fb", "ud", "yaw", "height_cm",
-               "heading", "bearing", "person_rate", "want_dps"]
+               "heading", "bearing", "person_rate", "want_dps", "note"]
 
     def __init__(self, lifters=()):
         self.lift_columns = [f"{n}_{c}" for n in lifters for c in ("jitter", "l_forearm", "r_forearm")]
@@ -456,7 +481,7 @@ class FrameLog:
         self._window = []  # rows since the last summary
         logger.info("frame log: %s", self.path)
 
-    def row(self, now, infer_ms, reason, state, m, cmd, height, debug=None, lift=()):
+    def row(self, now, infer_ms, reason, state, m, cmd, height, debug=None, lift=(), note=""):
         frame_ms = (now - self._last_t) * 1000 if self._last_t is not None else 0.0
         self._last_t = now
         lr, fb, ud, yaw = cmd if cmd is not None else (0, 0, 0, 0)
@@ -467,6 +492,7 @@ class FrameLog:
             f"{ex:.3f}" if ex is not None else "", lr, fb, ud, yaw, height,
             *(f"{debug[k]:.2f}" if debug and k in debug else ""
               for k in ("heading", "bearing", "person_rate", "want_dps")),
+            note,
             *lift,
         ])
         self._window.append((infer_ms, reason, ex, yaw))

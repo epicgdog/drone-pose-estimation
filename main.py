@@ -6,7 +6,7 @@
     uv run python3 main.py --lifters both        # start with flo and fmpose3d side by side
 
 The dashboard always runs at http://127.0.0.1:8000: camera, 2d + 3d pose, commands, and
-a control to switch lifters. ctrl+c in the terminal lands.
+controls to switch lifters and change gains. ctrl+c in the terminal lands.
 
 Each frame: yolo 2d -> measure the person -> tracker picks an rc command -> send it.
 Forward/back and up/down are pd controlled, yaw is feedforward. The pieces live in tracker.py.
@@ -28,6 +28,7 @@ from inference import VideoFrameInference, YOLOTestCoco
 from live_view import Controls, LiveServer
 from tracker import (
     LIFT_STALE_S,
+    TUNABLES,
     EventLog,
     FrameLog,
     LiftStats,
@@ -152,7 +153,7 @@ def track(drone, frame_read, args, workers: dict[str, LiftWorker], until: float 
     frames = FrameLog(lifters=list(workers))
     stats = [LiftStats(w) for w in workers.values()]
     start = LIFTERS if args.lifters == "both" else [args.lifters]
-    controls = Controls(list(workers), start)
+    controls = Controls(list(workers), start, TUNABLES, cfg.model_dump())
     # one euro filter on the 2d keypoints for the dashboard and the 3d lift only.
     # control (measure -> tracker) keeps using the raw keypoints, no added lag.
     euro2d, last_t2d = EuroFilter(), None
@@ -172,7 +173,15 @@ def track(drone, frame_read, args, workers: dict[str, LiftWorker], until: float 
             last_frame = frame
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-            active = controls.active()  # lifters picked on the dashboard
+            # 0. gain changes from the dashboard
+            note = ""
+            pending = controls.take_pending()
+            if pending:
+                cfg = TrackerConfig(**{**cfg.model_dump(), **pending})
+                tracker.set_config(cfg)
+                note = " ".join(f"{k}={v:g}" for k, v in pending.items())
+                logger.info("gains changed: %s", note)
+            active = controls.active()
 
             # 1. 2d pose
             t_frame = time.monotonic()  # when we got the frame, before inference
@@ -218,7 +227,7 @@ def track(drone, frame_read, args, workers: dict[str, LiftWorker], until: float 
 
             # 5. logs and dashboard
             lift = [v for s in stats for v in s.update(now)]
-            frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug, lift)
+            frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug, lift, note)
             publish_live(live, workers, active, now, bgr, k2d, det, infer_ms, state, cmd,
                          tracker, args)
             # a hold is a blip inside tracking, not a state change worth logging

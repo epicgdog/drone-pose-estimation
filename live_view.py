@@ -1,7 +1,8 @@
-"""Web dashboard for main.py: camera, 2d + 3d pose, rc commands, and a lifter switch.
+"""Web dashboard for main.py: camera, 2d + 3d pose, rc commands, and a few controls.
 
-main.py runs the loop and calls LiveServer.publish() every frame. The page can pick
-which 3d lifters run (flo, fmpose3d, or both).
+main.py runs the loop and calls LiveServer.publish() every frame. The page can:
+  - pick which 3d lifters run (flo, fmpose3d, or both)
+  - change the tunable gains (tracker.TUNABLES) mid-flight
 Each frame goes to the page as a server-sent event: jpeg + 2d keypoints + latest 3d poses.
 """
 
@@ -30,10 +31,13 @@ MAX_BODY = 4096  # control requests are tiny json
 
 
 class Controls:
-    def __init__(self, lifters, active):
+    def __init__(self, lifters, active, tunables, values):
         self._lock = threading.Lock()
         self.lifters = list(lifters)
         self._active = [n for n in active if n in self.lifters]
+        self.tunables = dict(tunables)
+        self._values = {k: values[k] for k in self.tunables}
+        self._pending = {}  # gain changes the loop hasn't applied yet
 
     def active(self) -> list[str]:
         with self._lock:
@@ -46,9 +50,32 @@ class Controls:
         with self._lock:
             self._active = names
 
+    def set_value(self, name: str, value) -> None:
+        if name not in self.tunables:
+            raise ValueError(f"{name} can't be changed from the page")
+        lo, hi, _ = self.tunables[name]
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError("value must be a number")
+        value = min(hi, max(lo, value))
+        with self._lock:
+            self._values[name] = value
+            self._pending[name] = value
+
+    def take_pending(self) -> dict:
+        with self._lock:
+            pending, self._pending = self._pending, {}
+            return pending
+
     def snapshot(self) -> dict:
         with self._lock:
-            return {"lifters": self.lifters, "active": list(self._active)}
+            return {
+                "lifters": self.lifters,
+                "active": list(self._active),
+                "values": dict(self._values),
+                "tunables": {k: {"min": lo, "max": hi, "step": st}
+                             for k, (lo, hi, st) in self.tunables.items()},
+            }
 
 
 class LiveState:
@@ -113,7 +140,7 @@ def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
         for name, s in skeletons.items()
     }
     # only this page may send controls. another site open in the browser could otherwise
-    # post to 127.0.0.1 and switch lifters.
+    # post to 127.0.0.1 and change gains.
     own_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
     class Handler(BaseHTTPRequestHandler):
@@ -136,7 +163,7 @@ def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
                 self._send(404, "text/plain", b"not found")
 
         def do_POST(self):
-            # body: {"lifters": [...]}
+            # body: {"lifters": [...]} | {"set": name, "value": v}
             if self.path != "/control":
                 return self._send(404, "text/plain", b"not found")
             if self.headers.get("Origin") not in own_origins:
@@ -151,6 +178,8 @@ def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
                 req = json.loads(self.rfile.read(length))
                 if "lifters" in req:
                     controls.set_active(req["lifters"])
+                elif "set" in req:
+                    controls.set_value(req["set"], req["value"])
                 else:
                     raise ValueError("unknown request")
             except (ValueError, TypeError, KeyError, AttributeError) as e:
