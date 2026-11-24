@@ -24,3 +24,4 @@ videos/
 *.mlpackage/
 logs/
 LATER_PLAN.md
+node_modules/

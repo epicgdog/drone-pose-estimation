@@ -2,8 +2,10 @@
 
     uv run python3 main.py                       # take off and track until ctrl+c
     uv run python3 main.py --flight-s 60         # land after 60 s
-    uv run python3 main.py --dry-run             # never fly, compute and log commands only
-    uv run python3 main.py --live-lift --lifters both   # also run flo and fmpose3d in 3d
+    uv run python3 main.py --dry-run             # never fly, just watch the dashboard
+    uv run python3 main.py --lifters fmpose3d    # 3d lift with fmpose3d instead of flo
+
+The dashboard (camera, 2d + 3d pose, commands) always runs at http://127.0.0.1:8000.
 
 Each frame: yolo 2d -> measure the person -> tracker picks an rc command -> send it.
 Forward/back and up/down are pd controlled, yaw is feedforward. The pieces live in tracker.py.
@@ -19,7 +21,9 @@ from djitellopy import Tello
 
 from euro_filter import EuroFilter
 from inference import VideoFrameInference, YOLOTestCoco
+from live_view import LiveServer
 from tracker import (
+    LIFT_STALE_S,
     EventLog,
     FrameLog,
     LiftStats,
@@ -41,15 +45,10 @@ def parse_args():
         help="compute and log commands, never send them to the drone",
     )
     parser.add_argument(
-        "--live-lift",
-        action="store_true",
-        help="also run the 3d lift live during flight (slows tracking, output unused for now)",
-    )
-    parser.add_argument(
         "--lifters",
         choices=["flo", "fmpose3d", "both"],
         default="flo",
-        help="3d lifter(s) for --live-lift: flo, fmpose3d, or both side by side (default flo)",
+        help="3d lifter(s): flo, fmpose3d, or both side by side (default flo)",
     )
     parser.add_argument(
         "--flight-s",
@@ -61,8 +60,6 @@ def parse_args():
 
 
 def make_workers(args) -> dict[str, LiftWorker]:
-    if not args.live_lift:
-        return {}
     names = ["flo", "fmpose3d"] if args.lifters == "both" else [args.lifters]
     # flo samples on cpu, fmpose3d on mps (yolo is on the neural engine)
     return {name: LiftWorker(VideoFrameInference(device="mps", backend=name), name)
@@ -77,11 +74,15 @@ def track(tello, frame_read, args, workers: dict[str, LiftWorker], until: float 
     events = EventLog()
     frames = FrameLog(lifters=list(workers))
     stats = [LiftStats(w) for w in workers.values()]
-    # one euro filter on the 2d keypoints for the 3d lift only.
+    # one euro filter on the 2d keypoints for the dashboard and the 3d lift only.
     # control (measure -> tracker) keeps using the raw keypoints, no added lag.
     euro2d, last_t2d = EuroFilter(), None
     last_frame = None
+    live = None
     try:
+        live = LiveServer({n: w.inference.skeleton for n, w in workers.items()},
+                          open_browser=True)
+
         while until is None or time.monotonic() < until:
             frame = frame_read.frame
             if frame is None or frame is last_frame:
@@ -95,7 +96,7 @@ def track(tello, frame_read, args, workers: dict[str, LiftWorker], until: float 
             det = yolo._detect_best_person(bgr)
             infer_ms = (time.monotonic() - t_frame) * 1000
 
-            # 2. smoothed 2d for the lift
+            # 2. smoothed 2d for display + lift
             k2d = None
             if det is None:
                 euro2d, last_t2d = EuroFilter(), None  # person gone, don't smooth across the gap
@@ -133,13 +134,35 @@ def track(tello, frame_read, args, workers: dict[str, LiftWorker], until: float 
                 cmd = None
                 state = "idle"
 
-            # 5. logs
+            # 5. logs and dashboard
             lift = [v for s in stats for v in s.update(now)]
             frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug, lift)
+            publish_live(live, workers, now, bgr, k2d, det, infer_ms, state, cmd, tracker)
             # a hold is a blip inside tracking, not a state change worth logging
             events.update("tracking" if state == "holding" else state, m, cmd)
     finally:
         frames.close()
+        if live is not None:
+            live.close()
+
+
+def publish_live(live, workers, now, bgr, k2d, det, infer_ms, state, cmd, tracker):
+    poses3d = {}
+    for name, w in workers.items():
+        out = w.output.get()
+        fresh = out is not None and now - out[1] < LIFT_STALE_S  # drop stale 3d poses
+        poses3d[name] = out[0] if fresh else None
+    live.publish(
+        bgr,
+        kpts=k2d,
+        scores=det.scores if det is not None else None,
+        poses3d=poses3d,
+        lift_ms={n: round(w.lift_ms, 1) for n, w in workers.items()},
+        detect_ms=round(infer_ms, 1),
+        state=state,
+        cmd=list(cmd) if cmd is not None else None,
+        person_rate=round(tracker.debug.get("person_rate", 0.0), 1),
+    )
 
 
 def main():
