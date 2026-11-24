@@ -51,8 +51,7 @@ class TrackerConfig(BaseModel):
     mix_split: float = 0.2  # |x error| where the blend is half yaw, half strafe
 
     # lost person handling
-    lost_freeze_s: float = 1.0  # hover this long before searching
-    search_yaw: float = 25
+    hold_s: float = 0.3  # on a dropout, repeat the last command this long
     stale_s: float = 0.3  # no measurement this old counts as lost
 
     # altitude, cm
@@ -138,14 +137,22 @@ class PersonTracker:
         self.fb_axis = Axis(cfg.gain_fb, cfg.dz_size, cfg.d_gain_fb, cfg.cap_fb)
         self.state = "idle"
         self._last_seen = None  # time of last fresh measurement
-        self._last_ex = 0.0  # x error of last fresh measurement, for search dir
+        self._last_cmd = None  # last tracking command, repeated on short dropouts
         self._prev_err = None  # (t, errors) of the last measurement, for the d terms
 
     def reset(self):
         self._last_seen = None
-        self._last_ex = 0.0
+        self._last_cmd = None
         self._prev_err = None
         self.state = "idle"
+
+    def _alt_band(self, up_down: int, height_cm: float) -> int:
+        # keep the drone in the altitude band
+        if height_cm <= self.cfg.min_alt_cm:
+            up_down = max(up_down, 0)
+        if height_cm >= self.cfg.max_alt_cm:
+            up_down = min(up_down, 0)
+        return up_down
 
     def _rates(self, t: float, errors: tuple[float, ...]) -> tuple[float, ...]:
         # how fast each error changes, per second. 0 on the first frame and after a gap
@@ -167,13 +174,18 @@ class PersonTracker:
             if self._last_seen is None:
                 self._last_seen = now
             lost_for = now - self._last_seen
+
+            # short dropout: keep the last command instead of stopping the turn
+            if self._last_cmd is not None and lost_for < cfg.hold_s:
+                self.state = "holding"
+                lr, fb, ud, yaw = self._last_cmd
+                return lr, fb, self._alt_band(ud, height_cm), yaw
+
+            self._last_cmd = None
             self._prev_err = None
-            if lost_for < cfg.lost_freeze_s:
-                self.state = "frozen"
-                return 0, 0, 0, 0
-            self.state = "searching"
-            direction = 1 if self._last_ex >= 0 else -1
-            return 0, 0, 0, int(round(direction * cfg.search_yaw))
+            # no person: hover in place, never spin looking for one
+            self.state = "frozen"
+            return 0, 0, 0, 0
 
         self.state = "tracking"
         self._last_seen = m.t
@@ -181,7 +193,6 @@ class PersonTracker:
         ex = m.cx - 0.5  # positive: person right of center
         ey = 0.5 - m.cy  # positive: person above center
         es = cfg.target_size - m.size  # positive: person too far away
-        self._last_ex = ex
 
         # rates from the raw errors, before the deadzones zero them out
         dex, dey, des = self._rates(m.t, (ex, ey, es))
@@ -200,15 +211,10 @@ class PersonTracker:
         left_right = self.strafe_axis.update((1 - w) * ex, (1 - w) * dex)
         yaw = self.yaw_axis.update(w * ex, w * dex)
         forward_backward = self.fb_axis.update(es, des)
-        up_down = self.ud_axis.update(ey, dey)
+        up_down = self._alt_band(self.ud_axis.update(ey, dey), height_cm)
 
-        # keep the drone in the altitude band
-        if height_cm <= cfg.min_alt_cm:
-            up_down = max(up_down, 0)
-        if height_cm >= cfg.max_alt_cm:
-            up_down = min(up_down, 0)
-
-        return left_right, forward_backward, up_down, yaw
+        self._last_cmd = (left_right, forward_backward, up_down, yaw)
+        return self._last_cmd
 
 
 class LatestSlot:
@@ -317,8 +323,6 @@ class EventLog:
                 logger.info("airborne, looking for person")
             else:
                 logger.info("lost person, holding position")
-        elif new == "searching":
-            logger.info("searching: %s", describe(cmd))
         elif new == "idle":
             logger.info("on the ground, tracking idle")
 
@@ -364,7 +368,8 @@ def track(tello, frame_read, args, worker: LiftWorker | None, until: float | Non
             cmd = None
             state = "idle"
 
-        events.update(state, m, cmd)
+        # a hold is a blip inside tracking, not a state change worth logging
+        events.update("tracking" if state == "holding" else state, m, cmd)
 
 
 def main():
