@@ -21,8 +21,7 @@ import numpy as np
 from djitellopy import Tello
 
 from inference import YOLOTestCoco
-from main import wait_for_real_frame
-from tracker import LOG_DIR, TrackerConfig, measure
+from tracker import LOG_DIR, TrackerConfig, measure, wait_for_real_frame
 
 logger = logging.getLogger(__name__)
 

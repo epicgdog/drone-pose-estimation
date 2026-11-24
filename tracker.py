@@ -1,4 +1,3 @@
-import argparse
 import csv
 import logging
 import math
@@ -6,14 +5,10 @@ import threading
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
-from djitellopy import Tello
 from pydantic import BaseModel
 
-from euro_filter import EuroFilter
-from inference import VideoFrameInference, YOLOTestCoco
-from main import wait_for_real_frame
+from inference import VideoFrameInference
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +16,8 @@ logger = logging.getLogger(__name__)
 L_SHOULDER, R_SHOULDER, L_HIP, R_HIP = 5, 6, 11, 12
 
 RC_MAX = 100  # tello rc range is -100..100
+PLACEHOLDER_SHAPE = (300, 400)  # tello sends a black 300x400 image while waiting for frames
+FRAME_TIMEOUT = 10  # seconds
 LOG_DIR = Path("logs")  # per-frame tracking logs
 
 
@@ -65,6 +62,16 @@ class TrackerConfig(BaseModel):
     min_alt_cm: float = 50
     max_alt_cm: float = 250
     airborne_cm: float = 30
+
+
+def wait_for_real_frame(frame_read):
+    deadline = time.perf_counter() + FRAME_TIMEOUT
+    while time.perf_counter() < deadline:
+        frame = frame_read.frame
+        if frame is not None and frame.shape[:2] != PLACEHOLDER_SHAPE:
+            return frame
+        time.sleep(0.05)
+    raise RuntimeError(f"No video frames within {FRAME_TIMEOUT}s")
 
 
 class Measurement(BaseModel):
@@ -482,164 +489,3 @@ class FrameLog:
 
     def close(self):
         self._file.close()
-
-
-def track(tello, frame_read, args, workers: dict[str, LiftWorker] | None = None,
-          until: float | None = None):
-    # until: time.monotonic() deadline to stop tracking at, None runs until ctrl+c
-    workers = workers or {}
-    cfg = TrackerConfig()
-    yolo = YOLOTestCoco(device="mps")
-    yolo.setup_runtime()
-    tracker = PersonTracker(cfg)
-    events = EventLog()
-    frames = FrameLog(lifters=list(workers))
-    try:
-        _track_frames(tello, frame_read, args, workers, until, cfg, yolo, tracker, events, frames)
-    finally:
-        frames.close()
-
-
-def _track_frames(tello, frame_read, args, workers, until, cfg, yolo, tracker, events, frames):
-    # one euro filter on the 2d keypoints for the 3d lift only.
-    # control (measure -> tracker) keeps using the raw keypoints, no added lag.
-    euro2d, last_t2d = EuroFilter(), None
-    stats = [LiftStats(w) for w in workers.values()]
-    last_frame = None
-
-    while until is None or time.monotonic() < until:
-        frame = frame_read.frame
-        if frame is None or frame is last_frame:
-            time.sleep(0.005)
-            continue
-        last_frame = frame
-        # rgb to bgr since opencv and yolo expect bgr.
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-        t_frame = time.monotonic()  # when we got the frame, before inference
-        det = yolo._detect_best_person(bgr)
-        infer_ms = (time.monotonic() - t_frame) * 1000
-        k2d = None  # smoothed keypoints for the lift
-        if det is None:
-            euro2d, last_t2d = EuroFilter(), None  # person gone, don't smooth across the gap
-        else:
-            if last_t2d is not None and t_frame > last_t2d:
-                euro2d.set_rate(1.0 / (t_frame - last_t2d))
-            last_t2d = t_frame
-            k2d = euro2d.filter(det.keypoints.astype(np.float64)).astype(np.float32)
-        m = None
-        if det is None:
-            reason = "no_person"
-        else:
-            m = measure(det.keypoints, det.scores, bgr.shape, cfg, t=t_frame)
-            if m is None:
-                reason = "no_torso"  # person found, but shoulders/hips too unsure
-            else:
-                reason = "ok"
-                item = (k2d, det.scores, bgr.shape[:2])  # same 2d for every lifter
-                for w in workers.values():
-                    w.input.set(item)
-
-        height = tello.get_height()
-        now = time.monotonic()
-        if height > cfg.airborne_cm:
-            cmd = tracker.update(m, now, height, heading_deg=tello.get_yaw())
-            if not args.dry_run:
-                tello.send_rc_control(*cmd)
-            state = tracker.state
-        else:
-            # on the ground: send nothing, start fresh once airborne
-            tracker.reset()
-            cmd = None
-            state = "idle"
-
-        lift = [v for s in stats for v in s.update(now)]
-        frames.row(now, infer_ms, reason, state, m, cmd, height, tracker.debug, lift)
-        # a hold is a blip inside tracking, not a state change worth logging
-        events.update("tracking" if state == "holding" else state, m, cmd)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="follow a person with a tello drone")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="compute and log commands, never send them to the drone",
-    )
-    parser.add_argument(
-        "--live-lift",
-        action="store_true",
-        help="also run the 3d lift live during flight (slows tracking, output unused for now)",
-    )
-    parser.add_argument(
-        "--lifters",
-        choices=["flo", "fmpose3d", "both"],
-        default="flo",
-        help="3d lifter(s) for --live-lift: flo, fmpose3d, or both side by side (default flo)",
-    )
-    parser.add_argument(
-        "--flight-s",
-        type=float,
-        default=60,
-        help="seconds to track after takeoff before landing (default 60, 0 = until ctrl+c)",
-    )
-    args = parser.parse_args()
-
-    logger.info("Starting up!")
-    workers = {}
-    if args.live_lift:
-        names = ["flo", "fmpose3d"] if args.lifters == "both" else [args.lifters]
-        for name in names:
-            # flo samples on cpu, fmpose3d on mps (yolo is on the neural engine)
-            workers[name] = LiftWorker(VideoFrameInference(device="mps", backend=name), name)
-
-    tello = Tello()
-    tello.connect()
-    logger.info("Battery: %s", tello.get_battery())
-
-    tello.streamon()
-    frame_read = tello.get_frame_read()
-
-    # the laptop is the only controller: it takes off and lands. keep the phone app
-    # disconnected, its stick packets fight the rc commands sent here.
-    took_off = False
-    try:
-        wait_for_real_frame(frame_read)
-        for w in workers.values():
-            w.start()
-        if not args.dry_run:
-            logger.info("taking off, ctrl+c to land")
-            took_off = True  # set first so ctrl+c mid takeoff still lands
-            tello.takeoff()
-        until = None
-        if not args.dry_run and args.flight_s > 0:
-            until = time.monotonic() + args.flight_s
-            logger.info("landing in %.0f s", args.flight_s)
-        track(tello, frame_read, args, workers, until)
-        if until is not None:
-            logger.info("flight time up, landing")
-    except KeyboardInterrupt:
-        logger.info("interrupted, %s", "landing" if took_off else "stopping")
-    finally:
-        for w in workers.values():
-            w.stop()
-        if not args.dry_run:
-            try:
-                tello.send_rc_control(0, 0, 0, 0)
-            except Exception:
-                logger.exception("failed to send stop command")
-        if took_off:
-            try:
-                tello.land()
-            except Exception:
-                logger.exception("land failed, land it from the phone app or catch it")
-        tello.streamoff()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
-    # djitellopy logs every rc command at info; keep only its warnings and errors
-    Tello.LOGGER.setLevel(logging.WARNING)
-    main()

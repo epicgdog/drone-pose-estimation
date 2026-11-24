@@ -158,16 +158,6 @@ class VideoFrameInference:
         self.api.setup_runtime()
         self.api.setup_runtime = lambda: None
 
-    def infer(self, frame):
-        # one bgr frame -> 2d detection -> 3d pose (see lift), or None. benchmark use (main.py).
-        if not hasattr(self, "_yolo"):
-            self._yolo = YOLOTestCoco()
-            self._yolo.setup_runtime()
-        det = self._yolo._detect_best_person(frame)
-        if det is None:
-            return None
-        return self.lift(det.keypoints, det.scores, frame.shape[:2])
-
     def lift(self, coco_kpts, coco_scores, frame_shape):
         # coco_kpts: (17, 2) pixels in the source frame, coco_scores: (17,)
         # frame_shape: (h, w) of that frame, needed to normalize the 2d points.
