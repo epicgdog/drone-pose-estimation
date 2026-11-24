@@ -1,6 +1,7 @@
-"""Web dashboard for main.py: camera, 2d + 3d pose, state and rc commands.
+"""Web dashboard for main.py: camera, 2d + 3d pose, rc commands, and a lifter switch.
 
-main.py runs the loop and calls LiveServer.publish() every frame.
+main.py runs the loop and calls LiveServer.publish() every frame. The page can pick
+which 3d lifters run (flo, fmpose3d, or both).
 Each frame goes to the page as a server-sent event: jpeg + 2d keypoints + latest 3d poses.
 """
 
@@ -25,6 +26,29 @@ VENDOR = {
     "/vendor/OrbitControls.js": NODE_DIR / "three/examples/jsm/controls/OrbitControls.js",
 }
 JPEG_QUALITY = 70
+MAX_BODY = 4096  # control requests are tiny json
+
+
+class Controls:
+    def __init__(self, lifters, active):
+        self._lock = threading.Lock()
+        self.lifters = list(lifters)
+        self._active = [n for n in active if n in self.lifters]
+
+    def active(self) -> list[str]:
+        with self._lock:
+            return list(self._active)
+
+    def set_active(self, names) -> None:
+        names = [n for n in self.lifters if n in set(names)]  # known names, stable order
+        if not names:
+            raise ValueError("pick at least one lifter")
+        with self._lock:
+            self._active = names
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"lifters": self.lifters, "active": list(self._active)}
 
 
 class LiveState:
@@ -57,9 +81,11 @@ def frame_payload(bgr, kpts=None, scores=None, poses3d=None, **extra):
 
 class LiveServer:
     # dashboard server on a background thread. publish() each frame, close() at the end.
-    def __init__(self, skeletons, port: int = 8000, open_browser: bool = False):
+    def __init__(self, controls: Controls, skeletons, port: int = 8000, open_browser: bool = False):
         self.state = LiveState()
-        self.server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(self.state, skeletons))
+        self.controls = controls
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", port), make_handler(self.state, controls, skeletons, port))
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, name="web", daemon=True).start()
         url = f"http://127.0.0.1:{port}"  # not "localhost": it can resolve to ipv6, the server is ipv4
@@ -80,12 +106,15 @@ class LiveServer:
         self.server.server_close()
 
 
-def make_handler(state: LiveState, skeletons):
+def make_handler(state: LiveState, controls: Controls, skeletons, port: int):
     lifters_meta = {
         name: {"skeleton": s.NAME, "bones": s.BONES,
                "left": sorted(s.JOINTS_LEFT), "right": sorted(s.JOINTS_RIGHT)}
         for name, s in skeletons.items()
     }
+    # only this page may send controls. another site open in the browser could otherwise
+    # post to 127.0.0.1 and switch lifters.
+    own_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -100,11 +129,33 @@ def make_handler(state: LiveState, skeletons):
                     return self._send(500, "text/plain", b"three.js missing, run npm install")
                 self._send(200, "text/javascript; charset=utf-8", VENDOR[self.path].read_bytes())
             elif self.path == "/meta":
-                self._json(200, {"lifters": lifters_meta})
+                self._json(200, {"lifters": lifters_meta, "controls": controls.snapshot()})
             elif self.path == "/events":
                 self._events()
             else:
                 self._send(404, "text/plain", b"not found")
+
+        def do_POST(self):
+            # body: {"lifters": [...]}
+            if self.path != "/control":
+                return self._send(404, "text/plain", b"not found")
+            if self.headers.get("Origin") not in own_origins:
+                return self._send(403, "text/plain", b"wrong origin")
+            # json content type means a cross-site page needs a cors preflight, which we never grant
+            if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                return self._send(415, "text/plain", b"send application/json")
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= MAX_BODY:
+                return self._send(400, "text/plain", b"bad length")
+            try:
+                req = json.loads(self.rfile.read(length))
+                if "lifters" in req:
+                    controls.set_active(req["lifters"])
+                else:
+                    raise ValueError("unknown request")
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
+                return self._json(400, {"error": str(e), "controls": controls.snapshot()})
+            self._json(200, {"controls": controls.snapshot()})
 
         def _json(self, code, obj):
             self._send(code, "application/json", json.dumps(obj).encode())

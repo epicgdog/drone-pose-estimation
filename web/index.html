@@ -32,6 +32,12 @@
   #nopose { position: absolute; inset: 0; display: grid; place-items: center;
             color: var(--muted); pointer-events: none; }
 
+  /* controls */
+  #controls { display: grid; grid-template-columns: 220px; gap: 12px; padding: 0 16px 16px; }
+  #controls .panel { padding: 12px; }
+  #controls h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 500; }
+  .lifter-pick label { display: block; padding: 3px 0; cursor: pointer; }
+  #ctlmsg { color: var(--bad); font-size: 12px; min-height: 1.4em; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -59,6 +65,14 @@
     <div class="hint">drag to orbit · scroll to zoom</div>
   </div>
 </main>
+<section id="controls">
+  <div class="panel">
+    <h3>3d lifters</h3>
+    <div class="lifter-pick" id="lifterpick"></div>
+    <div id="ctlmsg"></div>
+  </div>
+</section>
+
 <script>
 // camera, 2d skeleton and the stream live in a plain script, so the video keeps
 // working even if the 3d view (three.js module below) fails to load.
@@ -125,9 +139,52 @@ es.onmessage = ev => {
   show("cmd", d.cmd ? d.cmd.join(" / ") : null);
   show("prate", d.person_rate);
   show("source", d.source);
+  if (window.setActiveLifters && d.active) window.setActiveLifters(d.active);
   document.querySelectorAll(".track").forEach(e => e.style.display = d.state ? "" : "none");
   $("joints").textContent = d.kpts2d ? d.kpts2d.filter(k => k[2] >= KPT_CONF).length + "/17" : "–";
 };
+
+// ---------- controls ----------
+// every change goes to POST /control. the server answers with the current controls,
+// which is what the page then shows.
+const msg = $("ctlmsg");
+async function control(body) {
+  try {
+    const r = await fetch("/control", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json().catch(() => ({}));
+    msg.textContent = r.ok ? "" : (d.error || `request failed (${r.status})`);
+    if (d.controls) showControls(d.controls);
+  } catch (e) {
+    msg.textContent = "no connection to main.py";
+  }
+}
+
+const lifterOptions = names => [
+  ...names.map(n => ({ label: n, value: [n] })),
+  ...(names.length > 1 ? [{ label: "both", value: names }] : []),
+];
+
+function buildControls(c) {
+  const pick = $("lifterpick");
+  for (const opt of lifterOptions(c.lifters)) {
+    const l = document.createElement("label");
+    const r = document.createElement("input");
+    r.type = "radio"; r.name = "lifters"; r.value = opt.value.join(",");
+    r.onchange = () => control({ lifters: opt.value });
+    l.append(r, " " + opt.label);
+    pick.append(l);
+  }
+  showControls(c);
+}
+
+function showControls(c) {
+  const key = c.active.join(",");
+  document.querySelectorAll("input[name=lifters]").forEach(r => r.checked = r.value === key);
+}
+
+fetch("/meta").then(r => r.json()).then(m => buildControls(m.controls))
+  .catch(() => { msg.textContent = "could not load controls"; });
 
 // the 3d module registers window.setPose3d once three.js has loaded
 setTimeout(() => {
@@ -167,11 +224,8 @@ scene.add(new THREE.GridHelper(4, 16, 0x3a424c, 0x262c33));
 scene.add(new THREE.AxesHelper(0.3));
 
 const meta = await (await fetch("/meta")).json();
-const names = Object.keys(meta.lifters);  // e.g. ["flo"] or ["flo", "fmpose3d"]
-document.getElementById("title3d").textContent = "3d pose (" +
-  names.map(n => `${n}, ${meta.lifters[n].skeleton}-17`).join(" | ") + ")";
+const names = Object.keys(meta.lifters);  // every loaded lifter, e.g. ["flo", "fmpose3d"]
 const SPACING = 1.2;  // meters between skeletons, side by side along x
-if (names.length > 1) { camera.position.set(0.5, 1.4, 3.6); }
 
 const jointGeo = new THREE.SphereGeometry(0.025, 12, 8);
 const jointMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
@@ -204,7 +258,6 @@ const views = names.map((name, i) => {
   const side3d = (a, b) => (left.has(a) && left.has(b)) ? "left"
                          : (right.has(a) && right.has(b)) ? "right" : "mid";
   const group = new THREE.Group();
-  group.position.x = (i - (names.length - 1) / 2) * SPACING;
   scene.add(group);
   const joints = Array.from({ length: 17 }, () => {
     const s = new THREE.Mesh(jointGeo, jointMat); group.add(s); return s;
@@ -222,6 +275,24 @@ const views = names.map((name, i) => {
   return { name, group, joints, bones, label, parts: [...joints, ...bones.map(b => b.line)] };
 });
 
+// only the running lifters are shown, laid out side by side
+let activeKey = null;
+function setActive(active) {
+  const key = active.join(",");
+  if (key === activeKey) return;
+  activeKey = key;
+  const shown = views.filter(v => active.includes(v.name));
+  views.forEach(v => v.group.visible = false);
+  shown.forEach((v, i) => {
+    v.group.visible = true;
+    v.group.position.x = (i - (shown.length - 1) / 2) * SPACING;
+  });
+  document.getElementById("title3d").textContent = "3d pose (" +
+    shown.map(v => `${v.name}, ${meta.lifters[v.name].skeleton}-17`).join(" | ") + ")";
+  if (shown.length > 1) camera.position.set(0.5, 1.4, 3.6);
+  else camera.position.set(1.8, 1.2, 2.4);
+}
+setActive(meta.controls.active);
 const nopose = document.getElementById("nopose");
 
 function setView(view, p) {
@@ -244,7 +315,9 @@ function setView(view, p) {
 // poses: {lifter name: (17, 3) pose or null}. each lifter shows or hides on its own.
 function setPose(poses) {
   let any = false;
-  for (const view of views) any = setView(view, (poses || {})[view.name]) || any;
+  for (const view of views) {
+    if (view.group.visible) any = setView(view, (poses || {})[view.name]) || any;
+  }
   nopose.style.display = any ? "none" : "grid";
 }
 setPose({});
@@ -259,6 +332,7 @@ resize();
 renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
 
 window.setPose3d = setPose;
+window.setActiveLifters = setActive;
 </script>
 </body>
 </html>
